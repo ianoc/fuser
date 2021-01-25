@@ -28,7 +28,7 @@ pub use mount_options::MountOption;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
 pub use reply::ReplyXattr;
-pub use reply::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen};
+pub use reply::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyTpe, ReplyFailed, ReplyEntry, ReplyOpen};
 pub use reply::{
     ReplyBmap, ReplyCreate, ReplyDirectory, ReplyDirectoryPlus, ReplyIoctl, ReplyLock, ReplyLseek,
     ReplyStatfs, ReplyWrite,
@@ -310,8 +310,8 @@ pub trait Filesystem {
     fn destroy(&mut self, _req: &Request<'_>) {}
 
     /// Look up a directory entry by name and get its attributes.
-    fn lookup(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr, reply: ReplyEntry) {
-        reply.error(ENOSYS);
+    fn lookup(&mut self, _req: &Request<'_>, _parent: u64, _name: &OsStr) -> Result<ReplyTpe, ReplyFailed> {
+        Err(ReplyFailed::LibCError(ENOSYS))
     }
 
     /// Forget about an inode.

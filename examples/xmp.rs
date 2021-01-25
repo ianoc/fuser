@@ -135,9 +135,9 @@ fn errhandle(e: std::io::Error, not_found: impl FnOnce() -> ()) -> libc::c_int {
 }
 
 impl Filesystem for XmpFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr) -> Result<fuser::ReplyTpe, fuser::ReplyFailed> {
         if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
+            return Err(fuser::ReplyFailed::LibCError(ENOENT));
         }
 
         let parent_path = Path::new(&self.inode_to_path[&parent]);
@@ -147,12 +147,12 @@ impl Filesystem for XmpFS {
 
         match std::fs::symlink_metadata(entry_path) {
             Err(e) => {
-                reply.error(errhandle(e, || {
+                Err(fuser::ReplyFailed::LibCError(errhandle(e, || {
                     // if not found:
                     if let Some(ino) = entry_inode {
                         self.unregister_ino(ino);
                     }
-                }));
+                })))
             }
             Ok(m) => {
                 let ino = match entry_inode {
@@ -166,7 +166,7 @@ impl Filesystem for XmpFS {
 
                 let attr: FileAttr = meta2attr(&m, ino);
 
-                reply.entry(&TTL, &attr, 1);
+                Ok(fuser::ReplyTpe::entry(&TTL, &attr, 1))
             }
         }
     }

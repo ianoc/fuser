@@ -33,6 +33,18 @@ pub trait ReplySender: Send + 'static {
     fn send(&self, data: &[&[u8]]);
 }
 
+
+pub trait ReplySender2<U>: Send + 'static {
+    /// Send data.
+    fn send(self, data: &[&[u8]]) -> U;
+}
+pub trait Replyable<U>: Send + 'static {
+    /// Send data.
+    fn send(&self, uniq:u64 ,send_fn: impl ReplySender2<U>) -> U;
+}
+
+
+
 impl fmt::Debug for Box<dyn ReplySender> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "Box<ReplySender>")
@@ -270,6 +282,75 @@ impl ReplyData {
     /// Reply to a request with the given error code
     pub fn error(self, err: c_int) {
         self.reply.error(err);
+    }
+}
+
+struct RawReplayable {
+    unique: u64
+}
+impl RawReplayable {
+    /// Reply to a request with the given error code and data. Must be called
+    /// only once (the `ok` and `error` methods ensure this by consuming `self`)
+    fn send<U>(&mut self, err: c_int, bytes: &[&[u8]], send_fn: impl ReplySender2<U>) -> U{
+        let len = bytes.iter().fold(0, |l, b| l + b.len());
+        let header = fuse_out_header {
+            len: (mem::size_of::<fuse_out_header>() + len) as u32,
+            error: -err,
+            unique: self.unique,
+        };
+        as_bytes(&header, |headerbytes| {
+            let mut sendbytes = headerbytes.to_vec();
+            sendbytes.extend(bytes);
+            send_fn.send(&sendbytes)
+        })
+    }
+
+
+}
+
+
+///
+/// Reply with a failure message
+///
+#[derive(Debug)]
+pub  enum ReplyFailed {
+    /// Passing through generated libc errors -- we should move away from these to more concrete enum's letting the serialization handle it.
+    LibCError(c_int)
+}
+
+impl ReplyFailed {
+    pub fn send<U>(&self, unique:u64 ,send_fn: impl ReplySender2<U>) -> U {
+        match self {
+            ReplyFailed::LibCError(err) => {
+                RawReplayable{unique}.send(*err, &[], send_fn)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ReplyTpe(fuse_entry_out);
+
+impl<U> Replyable<U> for ReplyTpe {
+    fn send(&self, unique:u64, send_fn: impl ReplySender2<U>) -> U {
+        as_bytes(&self.0, |bytes| {
+        RawReplayable{unique}.send(0, bytes, send_fn)
+    })
+
+    }
+}
+impl ReplyTpe {
+    /// Generate an reply entry type.
+    pub fn entry(ttl: &Duration, attr: &FileAttr, generation: u64) -> ReplyTpe {
+        Self(fuse_entry_out {
+            nodeid: attr.ino,
+            generation,
+            entry_valid: ttl.as_secs(),
+            attr_valid: ttl.as_secs(),
+            entry_valid_nsec: ttl.subsec_nanos(),
+            attr_valid_nsec: ttl.subsec_nanos(),
+            attr: fuse_attr_from_attr(attr),
+        })
     }
 }
 

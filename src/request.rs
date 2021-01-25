@@ -5,7 +5,7 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
-use crate::fuse_abi::consts::*;
+use crate::{ReplyFailed, fuse_abi::consts::*, reply::{ReplySender2, Replyable}};
 use crate::fuse_abi::*;
 use libc::{EIO, ENOSYS, EPROTO};
 use log::{debug, error, warn};
@@ -41,6 +41,12 @@ pub struct Request<'a> {
     request: ll::Request<'a>,
 }
 
+struct SingleSender(ChannelSender);
+impl ReplySender2<std::io::Result<()>> for SingleSender {
+    fn send(self, data: &[&[u8]]) -> std::io::Result<()> {
+        self.0.send(data)
+    }
+}
 impl<'a> Request<'a> {
     /// Create a new request from the given data
     pub fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
@@ -139,8 +145,8 @@ impl<'a> Request<'a> {
             }
 
             ll::Operation::Lookup { name } => {
-                se.filesystem
-                    .lookup(self, self.request.nodeid(), &name, self.reply());
+                self.send(se.filesystem
+                    .lookup(self, self.request.nodeid(), &name));
             }
             ll::Operation::Forget { arg } => {
                 se.filesystem
@@ -721,6 +727,19 @@ impl<'a> Request<'a> {
         Reply::new(self.request.unique(), self.ch)
     }
 
+    fn send<T: Replyable<std::io::Result<()>>>(&self, t: Result<T, ReplyFailed>) -> std::io::Result<()> {
+        let sender = SingleSender(self.ch.clone());
+        match t {
+            Ok(t) => {
+                t.send(self.request.unique(), sender)
+            }
+            Err(t) => {
+                t.send(self.request.unique(), sender)
+            }
+        }
+        
+    }
+    
     /// Returns the unique identifier of this request
     #[inline]
     #[allow(dead_code)]
