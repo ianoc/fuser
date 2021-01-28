@@ -17,10 +17,14 @@ use libc::{self, c_int, c_void, size_t};
 use log::error;
 #[cfg(any(feature = "libfuse", test))]
 use std::ffi::OsStr;
-use std::ffi::{CStr, CString};
+use std::{ffi::{CStr, CString}, sync::Arc};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
 use std::path::{Path, PathBuf};
 use std::{io, ptr};
+use tokio::io::{Interest, unix::AsyncFd};
+use futures::ready;
+use async_trait::async_trait;
 
 use crate::reply::ReplySender;
 #[cfg(not(feature = "libfuse"))]
@@ -44,7 +48,8 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[&OsStr], f: F) -> T 
 #[derive(Debug)]
 pub struct Channel {
     mountpoint: PathBuf,
-    pub(in crate) fd: c_int,
+    raw_fd: RawFd,
+    pub(in crate) async_fd: Arc<AsyncFd<RawFd>>,
     pub(in crate) fuse_session: *mut c_void,
 }
 
@@ -64,7 +69,8 @@ impl Channel {
             } else {
                 Ok(Channel {
                     mountpoint,
-                    fd,
+                    raw_fd: fd,
+                    async_fd: Arc::new(AsyncFd::new(fd)?),
                     fuse_session: ptr::null_mut(),
                 })
             }
@@ -90,7 +96,8 @@ impl Channel {
             } else {
                 Ok(Channel {
                     mountpoint,
-                    fd,
+                    raw_fd: fd,
+                    async_fd: Arc::new(AsyncFd::new(fd)?),
                     fuse_session,
                 })
             }
@@ -106,7 +113,8 @@ impl Channel {
         } else {
             Ok(Channel {
                 mountpoint,
-                fd,
+                raw_fd: fd,
+                async_fd: Arc::new(AsyncFd::new(fd)?),
                 fuse_session: ptr::null_mut(),
             })
         }
@@ -118,23 +126,35 @@ impl Channel {
     }
 
     /// Receives data up to the capacity of the given buffer (can block).
-    pub fn receive(&self, buffer: &mut Vec<u8>) -> io::Result<()> {
-        let rc = unsafe {
-            libc::read(
-                self.fd,
-                buffer.as_ptr() as *mut c_void,
-                buffer.capacity() as size_t,
-            )
-        };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            unsafe {
-                buffer.set_len(rc as usize);
-            }
-            Ok(())
-        }
+    pub async fn receive(&self, mut buffer: Vec<u8>) -> io::Result<Vec<u8>> {
+        loop {
+            let mut guard = self.async_fd.readable().await?;
+            
+            match guard.try_io(|inner| 
+                {
+
+                    let rc = unsafe {
+                        libc::read(
+                            *inner.get_ref(),
+                            buffer.as_ptr() as *mut c_void,
+                            buffer.capacity() as size_t,
+                        )
+                    };
+                    if rc < 0 {
+                        Err(io::Error::last_os_error())
+                    } else {
+                            unsafe {
+                                buffer.set_len(rc as usize);
     }
+                        Ok(())
+                    }
+                }) {
+                Ok(result) => return result.map(|_| buffer),
+                Err(_would_block) => continue,
+            }
+    }
+}
+
 
     /// Returns a sender object for this channel. The sender object can be
     /// used to send to the channel. Multiple sender objects can be used
@@ -144,53 +164,67 @@ impl Channel {
         // a sender by using the same fd and use it in other threads. Only
         // the channel closes the fd when dropped. If any sender is used after
         // dropping the channel, it'll return an EBADF error.
-        ChannelSender { fd: self.fd }
+        ChannelSender { fd: self.async_fd.clone() }
     }
-}
 
-unsafe impl Send for Channel {}
+}
 
 impl Drop for Channel {
     fn drop(&mut self) {
         // TODO: send ioctl FUSEDEVIOCSETDAEMONDEAD on macOS before closing the fd
         // Close the communication channel to the kernel driver
         // (closing it before unnmount prevents sync unmount deadlock)
+        let handle = self.raw_fd;
         unsafe {
-            libc::close(self.fd);
+            libc::close(handle);
         }
         // Unmount this channel's mount point
-        let _ = unmount(&self.mountpoint, self.fuse_session, self.fd);
+        let _ = unmount(&self.mountpoint, self.fuse_session, handle);
         self.fuse_session = ptr::null_mut(); // unmount frees this pointer
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ChannelSender {
-    fd: c_int,
+    fd: Arc<AsyncFd<RawFd>>,
 }
+
 
 impl ChannelSender {
     /// Send all data in the slice of slice of bytes in a single write (can block).
-    pub fn send(&self, buffer: &[&[u8]]) -> io::Result<()> {
-        let iovecs: Vec<_> = buffer
-            .iter()
-            .map(|d| libc::iovec {
-                iov_base: d.as_ptr() as *mut c_void,
-                iov_len: d.len() as size_t,
-            })
-            .collect();
-        let rc = unsafe { libc::writev(self.fd, iovecs.as_ptr(), iovecs.len() as c_int) };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
+    pub async  fn send(&self, buffer: &[&[u8]]) -> io::Result<()> {
+
+        loop {
+            let mut guard = self.fd.writable().await?;
+
+
+            match guard.try_io(|inner| 
+                {
+                    let iovecs: Vec<_> = buffer
+                    .iter()
+                    .map(|d| libc::iovec {
+                        iov_base: d.as_ptr() as *mut c_void,
+                        iov_len: d.len() as size_t,
+                    })
+                    .collect();
+                let rc = unsafe { libc::writev(*inner.get_ref(), iovecs.as_ptr(), iovecs.len() as c_int) };
+                if rc < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+                }) {
+                Ok(result) => return result,
+                Err(_would_block) => continue,
+            }
         }
     }
 }
 
+#[async_trait]
 impl ReplySender for ChannelSender {
-    fn send(&self, data: &[&[u8]]) {
-        if let Err(err) = ChannelSender::send(self, data) {
+    async fn send(&self, data: &[&[u8]]) {
+        if let Err(err) = ChannelSender::send(self, data).await {
             error!("Failed to send FUSE reply: {}", err);
         }
     }

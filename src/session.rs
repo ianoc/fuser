@@ -7,9 +7,10 @@
 
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{error, info};
+use tokio::sync::RwLock;
 #[cfg(feature = "libfuse")]
 use std::ffi::OsStr;
-use std::io;
+use std::{io, sync::Arc};
 use std::path::{Path, PathBuf};
 use std::thread::{self, JoinHandle};
 use std::{fmt, ptr};
@@ -33,9 +34,9 @@ const BUFFER_SIZE: usize = MAX_WRITE_SIZE + 4096;
 #[derive(Debug)]
 pub struct Session<FS: Filesystem> {
     /// Filesystem operation implementations
-    pub filesystem: FS,
+    pub filesystem: Option<FS>,
     /// Communication channel to the kernel driver
-    ch: Channel,
+    ch: Option<Channel>,
     /// FUSE protocol major version
     pub proto_major: u32,
     /// FUSE protocol minor version
@@ -46,14 +47,16 @@ pub struct Session<FS: Filesystem> {
     pub destroyed: bool,
 }
 
+
+
 impl<FS: Filesystem> Session<FS> {
     /// Create a new session by mounting the given filesystem to the given mountpoint
     #[cfg(feature = "libfuse")]
     pub fn new(filesystem: FS, mountpoint: &Path, options: &[&OsStr]) -> io::Result<Session<FS>> {
         info!("Mounting {}", mountpoint.display());
         Channel::new(mountpoint, options).map(|ch| Session {
-            filesystem,
-            ch,
+            filesystem: Some(filesystem),
+            ch: Some(ch),
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
@@ -70,8 +73,8 @@ impl<FS: Filesystem> Session<FS> {
     ) -> io::Result<Session<FS>> {
         info!("Mounting {}", mountpoint.display());
         Channel::new2(mountpoint, options).map(|ch| Session {
-            filesystem,
-            ch,
+            filesystem: Some(filesystem),
+            ch: Some(ch),
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
@@ -80,43 +83,88 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     /// Return path of the mounted filesystem
-    pub fn mountpoint(&self) -> &Path {
-        &self.ch.mountpoint()
+    pub fn mountpoint(&self) -> PathBuf {
+        self.ch.as_ref().unwrap().mountpoint().to_owned()
+    }
+
+
+    async fn read_single_request<'a, 'b>(ch: &'a Channel, buffer: Vec<u8>) -> Option<io::Result<Request<'b>>> {
+            match ch.receive(buffer).await {
+                Err(err) =>
+                match err.raw_os_error() {
+                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
+                    Some(ENOENT) => return None,
+                    // Interrupted system call, retry
+                    Some(EINTR) => return None,
+                    // Explicitly try again
+                    Some(EAGAIN) => return None,
+                    // Filesystem was unmounted, quit the loop
+                    Some(ENODEV) => return Some(Err(err)),
+                    // Unhandled error
+                    _ => return Some(Err(err)),
+                },
+                Ok(buffer) =>
+                if let Some(req) =  Request::new(buffer) {
+                    return Some(Ok(req));
+                } 
+            };
+            None
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
     /// calls into the filesystem. This read-dispatch-loop is non-concurrent to prevent
     /// having multiple buffers (which take up much memory), but the filesystem methods
     /// may run concurrent by spawning threads.
-    pub fn run(&mut self) -> io::Result<()> {
+    pub async fn run(mut self) -> io::Result<()> {
         // Buffer for receiving requests from the kernel. Only one is allocated and
         // it is reused immediately after dispatching to conserve memory and allocations.
-        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+
+        let channel = self.ch.take().unwrap();
+
+        let sender = channel.sender();
         loop {
-            // Read the next request from the given channel to kernel driver
-            // The kernel driver makes sure that we get exactly one request per read
-            match self.ch.receive(&mut buffer) {
-                Ok(()) => match Request::new(self.ch.sender(), &buffer) {
-                    // Dispatch request
-                    Some(req) => req.dispatch(self),
-                    // Quit loop on illegal request
-                    None => break,
-                },
-                Err(err) => match err.raw_os_error() {
-                    // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                    Some(ENOENT) => continue,
-                    // Interrupted system call, retry
-                    Some(EINTR) => continue,
-                    // Explicitly try again
-                    Some(EAGAIN) => continue,
-                    // Filesystem was unmounted, quit the loop
-                    Some(ENODEV) => break,
-                    // Unhandled error
-                    _ => return Err(err),
-                },
+            let buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+            
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&channel, buffer).await {
+                let req = req_or_err?;
+                let initialized = req.dispatch_init(&mut self, sender.clone()).await;
+                if initialized {
+                    eprintln!("Initialized with: {:#?}", req);
+                    break;
+                }
             }
         }
-        Ok(())
+        info!("Initialized");
+        // se.filesystem.destroy(self);
+        // se.destroyed = true;
+        let mut filesystem = Arc::new(self.filesystem.take().unwrap());
+
+        loop {
+            let buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+            // Read the next request from the given channel to kernel driver
+            // The kernel driver makes sure that we get exactly one request per read
+
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&channel, buffer).await {
+                let req = req_or_err?;
+
+                if !req.maybe_destroy_dispatch(&mut self, sender.clone()).await {
+                    let filesystem = filesystem.clone();
+                    let sender = sender.clone();
+    
+                    tokio::spawn(async move {
+                     req.dispatch(filesystem, sender).await;
+                    });
+                } else {
+                    loop {
+                        if let Some(fs) = Arc::get_mut(&mut filesystem) {
+                            fs.destroy(&req);
+                            break;
+                        }
+                    }
+                    return Ok(())
+                }
+            }
+        }
     }
 }
 
@@ -150,21 +198,22 @@ impl BackgroundSession {
     pub fn new<FS: Filesystem + Send + 'static>(
         mut se: Session<FS>,
     ) -> io::Result<BackgroundSession> {
-        let mountpoint = se.mountpoint().to_path_buf();
-        // Take the fuse_session, so that we can unmount it
-        let fuse_session = se.ch.fuse_session;
-        let fd = se.ch.fd;
-        se.ch.fuse_session = ptr::null_mut();
-        let guard = thread::spawn(move || {
-            let mut se = se;
-            se.run()
-        });
-        Ok(BackgroundSession {
-            mountpoint,
-            guard,
-            fuse_session,
-            fd,
-        })
+        todo!()
+        // let mountpoint = se.mountpoint().to_path_buf();
+        // // Take the fuse_session, so that we can unmount it
+        // let fuse_session = se.ch.fuse_session;
+        // let fd = se.ch.fd;
+        // se.ch.fuse_session = ptr::null_mut();
+        // let guard = thread::spawn(move || {
+        //     let mut se = se;
+        //     se.run()
+        // });
+        // Ok(BackgroundSession {
+        //     mountpoint,
+        //     guard,
+        //     fuse_session,
+        //     fd,
+        // })
     }
 }
 

@@ -24,23 +24,28 @@ use std::marker::PhantomData;
 use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, slice};
-
+use async_trait::async_trait;
+use std::io;
 use crate::{FileAttr, FileType};
 
 /// Generic reply callback to send data
-pub trait ReplySender: Send + 'static {
+#[async_trait]
+pub trait ReplySender: Send + Sync + 'static {
     /// Send data.
-    fn send(&self, data: &[&[u8]]);
+    async fn send(&self, data: &[&[u8]]);
 }
 
 
-pub trait ReplySender2<U>: Send + 'static {
+
+#[async_trait]
+pub trait ReplySender2: Send + 'static {
     /// Send data.
-    fn send(self, data: &[&[u8]]) -> U;
+    async fn send(self, data: &[&[u8]]) -> io::Result<()>;
 }
-pub trait Replyable<U>: Send + 'static {
+#[async_trait]
+pub trait Replyable: Send + 'static {
     /// Send data.
-    fn send(&self, uniq:u64 ,send_fn: impl ReplySender2<U>) -> U;
+    async fn send(&self, uniq:u64 ,send_fn: impl ReplySender2) -> io::Result<()>;
 }
 
 
@@ -69,6 +74,20 @@ fn as_bytes<T, U, F: FnOnce(&[&[u8]]) -> U>(data: &T, f: F) -> U {
         }
     }
 }
+
+
+fn cast_raw_bytes<T>(data: &T) -> &[u8] {
+    let len = mem::size_of::<T>();
+    match len {
+        0 => &[],
+        len => {
+            let p = data as *const T as *const u8;
+            let bytes = unsafe { slice::from_raw_parts(p, len) };
+            bytes
+        }
+    }
+}
+
 
 fn time_from_system_time(system_time: &SystemTime) -> (i64, u32) {
     // Convert to signed 64-bit time with epoch at 0
@@ -188,7 +207,7 @@ impl<T> Reply for ReplyRaw<T> {
 impl<T> ReplyRaw<T> {
     /// Reply to a request with the given error code and data. Must be called
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
-    fn send(&mut self, err: c_int, bytes: &[&[u8]]) {
+    async fn send(&mut self, err: c_int, bytes: &[&[u8]]) {
         assert!(self.sender.is_some());
         let len = bytes.iter().fold(0, |l, b| l + b.len());
         let header = fuse_out_header {
@@ -196,24 +215,23 @@ impl<T> ReplyRaw<T> {
             error: -err,
             unique: self.unique,
         };
-        as_bytes(&header, |headerbytes| {
+        let headerbytes = &[cast_raw_bytes(&header)];
+
             let sender = self.sender.take().unwrap();
             let mut sendbytes = headerbytes.to_vec();
             sendbytes.extend(bytes);
-            sender.send(&sendbytes);
-        });
+            sender.send(&sendbytes).await;
     }
 
     /// Reply to a request with the given type
-    pub fn ok(mut self, data: &T) {
-        as_bytes(data, |bytes| {
-            self.send(0, bytes);
-        })
+    pub async  fn ok(mut self, data: &T) {
+        let bytes = &[cast_raw_bytes(data)];
+        self.send(0, bytes).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(mut self, err: c_int) {
-        self.send(err, &[]);
+    pub async fn error(mut self, err: c_int) {
+        self.send(err, &[]).await;
     }
 }
 
@@ -247,13 +265,13 @@ impl Reply for ReplyEmpty {
 
 impl ReplyEmpty {
     /// Reply to a request with nothing
-    pub fn ok(mut self) {
-        self.reply.send(0, &[]);
+    pub async fn ok(mut self) {
+        self.reply.send(0, &[]).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -275,13 +293,13 @@ impl Reply for ReplyData {
 
 impl ReplyData {
     /// Reply to a request with the given data
-    pub fn data(mut self, data: &[u8]) {
-        self.reply.send(0, &[data]);
+    pub async fn data(mut self, data: &[u8]) {
+        self.reply.send(0, &[data]).await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+     pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -291,18 +309,18 @@ struct RawReplayable {
 impl RawReplayable {
     /// Reply to a request with the given error code and data. Must be called
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
-    fn send<U>(&mut self, err: c_int, bytes: &[&[u8]], send_fn: impl ReplySender2<U>) -> U{
+    async fn send(&mut self, err: c_int, bytes: &[&[u8]], send_fn: impl ReplySender2) ->  io::Result<()>{
         let len = bytes.iter().fold(0, |l, b| l + b.len());
         let header = fuse_out_header {
             len: (mem::size_of::<fuse_out_header>() + len) as u32,
             error: -err,
             unique: self.unique,
         };
-        as_bytes(&header, |headerbytes| {
+        let headerbytes = &[cast_raw_bytes(&header)];
+
             let mut sendbytes = headerbytes.to_vec();
             sendbytes.extend(bytes);
-            send_fn.send(&sendbytes)
-        })
+            send_fn.send(&sendbytes).await
     }
 
 
@@ -319,10 +337,10 @@ pub  enum ReplyFailed {
 }
 
 impl ReplyFailed {
-    pub fn send<U>(&self, unique:u64 ,send_fn: impl ReplySender2<U>) -> U {
+    pub async fn send(&self, unique:u64 ,send_fn: impl ReplySender2) -> io::Result<()> {
         match self {
             ReplyFailed::LibCError(err) => {
-                RawReplayable{unique}.send(*err, &[], send_fn)
+                RawReplayable{unique}.send(*err, &[], send_fn).await
             }
         }
     }
@@ -331,12 +349,11 @@ impl ReplyFailed {
 #[derive(Debug)]
 pub struct ReplyTpe(fuse_entry_out);
 
-impl<U> Replyable<U> for ReplyTpe {
-    fn send(&self, unique:u64, send_fn: impl ReplySender2<U>) -> U {
-        as_bytes(&self.0, |bytes| {
-        RawReplayable{unique}.send(0, bytes, send_fn)
-    })
-
+#[async_trait]
+impl Replyable for ReplyTpe {
+    async fn send(&self, unique:u64, send_fn: impl ReplySender2) -> io::Result<()> {
+        let bytes = &[cast_raw_bytes(&self.0)];
+        RawReplayable{unique}.send(0, bytes, send_fn).await
     }
 }
 impl ReplyTpe {
@@ -385,8 +402,8 @@ impl ReplyEntry {
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -408,18 +425,18 @@ impl Reply for ReplyAttr {
 
 impl ReplyAttr {
     /// Reply to a request with the given attribute
-    pub fn attr(self, ttl: &Duration, attr: &FileAttr) {
+    pub async fn attr(self, ttl: &Duration, attr: &FileAttr) {
         self.reply.ok(&fuse_attr_out {
             attr_valid: ttl.as_secs(),
             attr_valid_nsec: ttl.subsec_nanos(),
             dummy: 0,
             attr: fuse_attr_from_attr(attr),
-        });
+        }).await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -479,17 +496,17 @@ impl Reply for ReplyOpen {
 
 impl ReplyOpen {
     /// Reply to a request with the given open result
-    pub fn opened(self, fh: u64, flags: u32) {
+    pub async fn opened(self, fh: u64, flags: u32) {
         self.reply.ok(&fuse_open_out {
             fh,
             open_flags: flags,
             padding: 0,
-        });
+        }).await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -511,13 +528,13 @@ impl Reply for ReplyWrite {
 
 impl ReplyWrite {
     /// Reply to a request with the given open result
-    pub fn written(self, size: u32) {
-        self.reply.ok(&fuse_write_out { size, padding: 0 });
+    pub async fn written(self, size: u32) {
+        self.reply.ok(&fuse_write_out { size, padding: 0 }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -540,7 +557,7 @@ impl Reply for ReplyStatfs {
 impl ReplyStatfs {
     /// Reply to a request with the given open result
     #[allow(clippy::too_many_arguments)]
-    pub fn statfs(
+    pub async fn statfs(
         self,
         blocks: u64,
         bfree: u64,
@@ -564,12 +581,12 @@ impl ReplyStatfs {
                 padding: 0,
                 spare: [0; 6],
             },
-        });
+        }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -771,13 +788,13 @@ impl ReplyDirectory {
     }
 
     /// Reply to a request with the filled directory buffer
-    pub fn ok(mut self) {
-        self.reply.send(0, &[&self.data]);
+    pub async fn ok(mut self) {
+        self.reply.send(0, &[&self.data]).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -877,18 +894,18 @@ impl Reply for ReplyXattr {
 
 impl ReplyXattr {
     /// Reply to a request with the size of the xattr.
-    pub fn size(self, size: u32) {
-        self.reply.ok(&fuse_getxattr_out { size, padding: 0 });
+    pub async fn size(self, size: u32) {
+        self.reply.ok(&fuse_getxattr_out { size, padding: 0 }).await;
     }
 
     /// Reply to a request with the data in the xattr.
-    pub fn data(mut self, data: &[u8]) {
-        self.reply.send(0, &[data]);
+    pub async fn data(mut self, data: &[u8]) {
+        self.reply.send(0, &[data]).await;
     }
 
     /// Reply to a request with the given error code.
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 

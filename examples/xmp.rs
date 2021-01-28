@@ -6,7 +6,8 @@ use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, R
 use libc::c_int;
 use libc::{EINVAL, EIO, ENOENT, ENOSYS, EPERM};
 use libc::{O_ACCMODE, O_APPEND, O_CREAT, O_EXCL, O_RDONLY, O_RDWR, O_TRUNC, O_WRONLY};
-use std::env;
+use tokio::sync::Mutex;
+use std::{convert::TryInto, env, sync::Arc};
 use std::ffi::{OsStr, OsString};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -16,6 +17,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::SystemTime;
+use async_trait::async_trait;
 
 use log::{error};
 
@@ -30,58 +32,58 @@ struct DirInfo {
 struct XmpFS {
     /// I don't want to include `slab` in dev-dependencies, so using a counter instead.
     /// This provides a source of new inodes and filehandles
-    counter: u64,
+    counter: std::sync::atomic::AtomicU64,
 
-    inode_to_path: HashMap<u64, OsString>,
-    path_to_inode: HashMap<OsString, u64>,
-
-    opened_directories: HashMap<u64, Vec<DirInfo>>,
-    opened_files: HashMap<u64, std::fs::File>,
+    inode_to_path: Arc<Mutex<HashMap<u64, OsString>>>,
+    path_to_inode: Arc<Mutex<HashMap<OsString, u64>>>,
+    opened_directories: Arc<Mutex<HashMap<u64, Vec<DirInfo>>>>,
+    opened_files: Arc<Mutex<HashMap<u64, Arc<std::fs::File>>>>,
+    buffer_pool: Arc<Mutex<pool::Pool<Vec<u8>>>>
 }
 
 impl XmpFS {
     pub fn new() -> XmpFS {
         XmpFS {
-            counter: 1,
-            inode_to_path: HashMap::with_capacity(1024),
-            path_to_inode: HashMap::with_capacity(1024),
-            opened_directories: HashMap::with_capacity(2),
-            opened_files: HashMap::with_capacity(2),
+            counter: std::sync::atomic::AtomicU64::new(1),
+            inode_to_path: Arc::new(Mutex::new(HashMap::with_capacity(1024))),
+            path_to_inode: Arc::new(Mutex::new(HashMap::with_capacity(1024))),
+            opened_directories: Arc::new(Mutex::new(HashMap::with_capacity(2))),
+            opened_files: Arc::new(Mutex::new(HashMap::with_capacity(2))),
+            buffer_pool: Arc::new(Mutex::new(pool::Pool::with_capacity(20, 20, || Vec::with_capacity(16_384)))),
         }
     }
 
-    pub fn populate_root_dir(&mut self) {
-        let rootino = self.add_inode(OsStr::from_bytes(b"/"));
+    pub async fn populate_root_dir(&mut self) {
+        let rootino = self.add_inode(OsStr::from_bytes(b"/")).await;
         assert_eq!(rootino, 1);
     }
 
-    pub fn add_inode(&mut self, path: &OsStr) -> u64 {
-        let ino = self.counter;
-        self.counter += 1;
-        self.path_to_inode.insert(path.to_os_string(), ino);
-        self.inode_to_path.insert(ino, path.to_os_string());
+    pub async fn add_inode(&self, path: &OsStr) -> u64 {
+        let ino = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.path_to_inode.lock().await.insert(path.to_os_string(), ino);
+        self.inode_to_path.lock().await.insert(ino, path.to_os_string());
         ino
     }
 
-    pub fn add_or_create_inode(&mut self, path: impl AsRef<Path>) -> u64 {
-        if let Some(x) = self.path_to_inode.get(path.as_ref().as_os_str()) {
+    pub async fn add_or_create_inode(&self, path: impl AsRef<Path>) -> u64 {
+        if let Some(x) = self.path_to_inode.lock().await.get(path.as_ref().as_os_str()) {
             return *x;
         }
 
-        self.add_inode(path.as_ref().as_os_str())
+        self.add_inode(path.as_ref().as_os_str()).await
     }
-    pub fn get_inode(&self, path: impl AsRef<Path>) -> Option<u64> {
-        self.path_to_inode
+    pub async fn get_inode(&self, path: impl AsRef<Path>) -> Option<u64> {
+        self.path_to_inode.lock().await
             .get(path.as_ref().as_os_str())
             .map(|x| *x)
     }
 
-    pub fn unregister_ino(&mut self, ino: u64) {
-        if !self.inode_to_path.contains_key(&ino) {
+    pub async fn unregister_ino(&self, ino: u64) {
+        if !self.inode_to_path.lock().await.contains_key(&ino) {
             return;
         }
-        self.path_to_inode.remove(&self.inode_to_path[&ino]);
-        self.inode_to_path.remove(&ino);
+        self.path_to_inode.lock().await.remove(&self.inode_to_path.lock().await[&ino]);
+        self.inode_to_path.lock().await.remove(&ino);
     }
 }
 
@@ -120,11 +122,13 @@ fn meta2attr(m: &std::fs::Metadata, ino: u64) -> FileAttr {
     }
 }
 
-fn errhandle(e: std::io::Error, not_found: impl FnOnce() -> ()) -> libc::c_int {
+async fn errhandle<T: std::future::Future>(e: std::io::Error, not_found: impl FnOnce() -> Option<T>) -> libc::c_int {
     match e.kind() {
         ErrorKind::PermissionDenied => EPERM,
         ErrorKind::NotFound => {
-            not_found();
+            if let Some(f) = not_found() {
+                f.await;
+            }
             ENOENT
         }
         e => {
@@ -134,33 +138,51 @@ fn errhandle(e: std::io::Error, not_found: impl FnOnce() -> ()) -> libc::c_int {
     }
 }
 
+async fn errhandle_no_cleanup(e: std::io::Error) -> libc::c_int {
+    match e.kind() {
+        ErrorKind::PermissionDenied => EPERM,
+        ErrorKind::NotFound => {
+            ENOENT
+        }
+        e => {
+            error!("{:?}", e);
+            EIO
+        }
+    }
+}
+
+#[async_trait]
 impl Filesystem for XmpFS {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr) -> Result<fuser::ReplyTpe, fuser::ReplyFailed> {
-        if !self.inode_to_path.contains_key(&parent) {
+    async fn lookup(&self, _req: &Request<'_>, parent: u64, name: &OsStr) -> Result<fuser::ReplyTpe, fuser::ReplyFailed> {
+        if !self.inode_to_path.lock().await.contains_key(&parent) {
             return Err(fuser::ReplyFailed::LibCError(ENOENT));
         }
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
+        let entry_path = {
+            let tbl = self.inode_to_path.lock().await;
+        let tmp_v = &tbl[&parent];
+        let parent_path = Path::new(&tmp_v);
+        parent_path.join(name).to_owned()
+        };
+        let entry_inode = self.get_inode(&entry_path).await;
 
-        let entry_inode = self.get_inode(&entry_path);
-
-        match std::fs::symlink_metadata(entry_path) {
+        match std::fs::symlink_metadata(&entry_path) {
             Err(e) => {
                 Err(fuser::ReplyFailed::LibCError(errhandle(e, || {
                     // if not found:
                     if let Some(ino) = entry_inode {
-                        self.unregister_ino(ino);
+                        Some(self.unregister_ino(ino))
+                    } else {
+                        None
                     }
-                })))
+                }).await))
             }
             Ok(m) => {
                 let ino = match entry_inode {
                     Some(x) => x,
                     None => {
-                        let parent_path = Path::new(&self.inode_to_path[&parent]);
-                        let entry_path = parent_path.join(name);
-                        self.add_or_create_inode(entry_path)
+                  
+                        self.add_or_create_inode(entry_path).await
                     }
                 };
 
@@ -171,33 +193,39 @@ impl Filesystem for XmpFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
-        if !self.inode_to_path.contains_key(&ino) {
-            return reply.error(ENOENT);
+    async fn getattr(&self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
+        if !self.inode_to_path.lock().await.contains_key(&ino) {
+            return reply.error(ENOENT).await
         }
 
-        let entry_path = Path::new(&self.inode_to_path[&ino]);
+        let metadata = {
+            let handle = self.inode_to_path.lock().await;
 
-        match std::fs::symlink_metadata(entry_path) {
+        let entry_path = Path::new(&handle[&ino]);
+
+        std::fs::symlink_metadata(entry_path)
+        };
+        match metadata {
             Err(e) => {
                 reply.error(errhandle(e, || {
                     // if not found:
-                    self.unregister_ino(ino);
-                }));
+                    
+                        Some(self.unregister_ino(ino))
+                    
+                }).await).await;
             }
             Ok(m) => {
                 let attr: FileAttr = meta2attr(&m, ino);
-                reply.attr(&TTL, &attr);
+                reply.attr(&TTL, &attr).await;
             }
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, flags: i32, reply: ReplyOpen) {
-        if !self.inode_to_path.contains_key(&ino) {
-            return reply.error(ENOENT);
+    async fn open(&self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        if !self.inode_to_path.lock().await.contains_key(&ino) {
+            return reply.error(ENOENT).await;
         }
 
-        let entry_path = Path::new(&self.inode_to_path[&ino]);
 
         let mut oo = std::fs::OpenOptions::new();
 
@@ -215,34 +243,36 @@ impl Filesystem for XmpFS {
                 oo.read(true);
                 oo.write(true);
             }
-            _ => return reply.error(EINVAL),
+            _ => return reply.error(EINVAL).await,
         }
 
         oo.create(false);
         if fl & (O_EXCL | O_CREAT) != 0 {
             error!("Wrong flags on open");
-            return reply.error(EIO);
+            return reply.error(EIO).await;
         }
 
         oo.append(fl & O_APPEND == O_APPEND);
         oo.truncate(fl & O_TRUNC == O_TRUNC);
 
-        match oo.open(entry_path) {
-            Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(f) => {
-                let fh = self.counter;
-                self.counter += 1;
+        let p = self.inode_to_path.lock().await[&ino].clone();
+        let entry_path = Path::new(&p);
 
-                self.opened_files.insert(fh, f);
-                reply.opened(fh, 0);
+        match oo.open(entry_path) {
+            Err(e) => reply.error(errhandle(e, || Some(self.unregister_ino(ino))).await).await,
+            Ok(f) => {
+                let ino = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                self.opened_files.lock().await.insert(ino, Arc::new(f));
+                reply.opened(ino, 0).await;
             }
         }
     }
 
 
-    fn create(
-        &mut self,
-        _req: &Request,
+    async fn create(
+        &self,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         mode: u32,
@@ -251,63 +281,64 @@ impl Filesystem for XmpFS {
         flags:i32,
         reply: ReplyCreate,
     ) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
+        // if !self.inode_to_path.lock().await.contains_key(&parent) {
+        //     return reply.error(ENOENT);
+        // }
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
+        // let parent_path = Path::new(&self.inode_to_path.lock().await[&parent]);
+        // let entry_path = parent_path.join(name);
 
-        let ino = self.add_or_create_inode(&entry_path);
+        // let ino = self.add_or_create_inode(&entry_path).await;
 
-        let mut oo = std::fs::OpenOptions::new();
+        // let mut oo = std::fs::OpenOptions::new();
 
-        let fl = flags as c_int;
-        match fl & O_ACCMODE {
-            O_RDONLY => {
-                oo.read(true);
-                oo.write(false);
-            }
-            O_WRONLY => {
-                oo.read(false);
-                oo.write(true);
-            }
-            O_RDWR => {
-                oo.read(true);
-                oo.write(true);
-            }
-            _ => return reply.error(EINVAL),
-        }
+        // let fl = flags as c_int;
+        // match fl & O_ACCMODE {
+        //     O_RDONLY => {
+        //         oo.read(true);
+        //         oo.write(false);
+        //     }
+        //     O_WRONLY => {
+        //         oo.read(false);
+        //         oo.write(true);
+        //     }
+        //     O_RDWR => {
+        //         oo.read(true);
+        //         oo.write(true);
+        //     }
+        //     _ => return reply.error(EINVAL),
+        // }
 
-        oo.create(fl & O_CREAT == O_CREAT);
-        oo.create_new(fl & O_EXCL == O_EXCL);
-        oo.append(fl & O_APPEND == O_APPEND);
-        oo.truncate(fl & O_TRUNC == O_TRUNC);
-        oo.mode(mode);
+        // oo.create(fl & O_CREAT == O_CREAT);
+        // oo.create_new(fl & O_EXCL == O_EXCL);
+        // oo.append(fl & O_APPEND == O_APPEND);
+        // oo.truncate(fl & O_TRUNC == O_TRUNC);
+        // oo.mode(mode);
 
-        match oo.open(&entry_path) {
-            Err(e) => return reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(f) => {
-                let meta = match std::fs::symlink_metadata(entry_path) {
-                    Err(e) => {
-                        return reply.error(errhandle(e, || self.unregister_ino(ino)));
-                    }
-                    Ok(m) => meta2attr(&m, ino),
-                };
-                let fh = self.counter;
-                self.counter += 1;
+        // match oo.open(&entry_path) {
+        //     Err(e) => return reply.error(errhandle(e, || Some(self.unregister_ino(ino))).await),
+        //     Ok(f) => {
+        //         let meta = match std::fs::symlink_metadata(entry_path) {
+        //             Err(e) => {
+        //                 return reply.error(errhandle(e, || Some(self.unregister_ino(ino))).await);
+        //             }
+        //             Ok(m) => meta2attr(&m, ino),
+        //         };
+        //         let fh = self.counter;
+        //         self.counter += 1;
 
-                self.opened_files.insert(fh, f);
-                reply.created(&TTL, &meta, 1, fh, 0);
-            }
-        }
+        //         self.opened_files.lock().await.insert(fh, f);
+        //         reply.created(&TTL, &meta, 1, fh, 0);
+        //     }
+        // }
+        todo!()
     }
 
 
 
-    fn read(
-        &mut self,
-        _req: &Request,
+    async fn read(
+        &self,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
@@ -317,13 +348,15 @@ impl Filesystem for XmpFS {
 
         reply: ReplyData,
     ) {
-        if !self.opened_files.contains_key(&fh) {
-            return reply.error(EIO);
-        }
+        let file_opt: Option<Arc<std::fs::File>> = self.opened_files.lock().await.get(&fh).map(|e| e.clone());
+        let f = match file_opt {
+            None =>
+                {return reply.error(EIO).await;}
+                Some(f) => f
+        };
         let size = size as usize;
 
-        let f = self.opened_files.get_mut(&fh).unwrap();
-
+        // let mut b = self.buffer_pool.lock().await.checkout().unwrap();
         let mut b = Vec::with_capacity(size);
         b.resize(size, 0);
 
@@ -332,9 +365,8 @@ impl Filesystem for XmpFS {
         let mut bo = 0;
         while bo < size {
             match f.read_at(&mut b[bo..], offset as u64) {
-                Err(e) => return reply.error(errhandle(e, || ())),
+                Err(e) => {return reply.error(errhandle_no_cleanup(e).await).await},
                 Ok(0) => {
-                    b.resize(bo, 0);
                     break;
                 }
                 Ok(ret) => {
@@ -343,14 +375,14 @@ impl Filesystem for XmpFS {
             };
         }
 
-        reply.data(&b[..]);
+        reply.data(&b[..bo]).await;
     }
 
  
 
-    fn write(
-        &mut self,
-        _req: &Request,
+    async fn write(
+        &self,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
@@ -362,56 +394,60 @@ impl Filesystem for XmpFS {
 
         reply: ReplyWrite,
     ) {
-        if !self.opened_files.contains_key(&fh) {
-            return reply.error(EIO);
-        }
+        todo!()
+        // if !self.opened_files.lock().await.contains_key(&fh) {
+        //     return reply.error(EIO);
+        // }
 
-        let f = self.opened_files.get_mut(&fh).unwrap();
+        // let f = self.opened_files.lock().await.get_mut(&fh).unwrap();
 
-        use std::os::unix::fs::FileExt;
+        // use std::os::unix::fs::FileExt;
 
-        match f.write_all_at(data, offset as u64) {
-            Err(e) => return reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                reply.written(data.len() as u32);
-            }
-        };
+        // match f.write_all_at(data, offset as u64) {
+        //     Err(e) => return reply.error(errhandle(e, || None).await),
+        //     Ok(()) => {
+        //         reply.written(data.len() as u32);
+        //     }
+        // };
     }
 
-    fn fsync(&mut self, _req: &Request, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
-        if !self.opened_files.contains_key(&fh) {
-            return reply.error(EIO);
-        }
+    async fn fsync(&self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+        todo!()
+        // if !self.opened_files.lock().await.contains_key(&fh) {
+        //     reply.error(EIO);
+        //     return;
+        // }
 
-        let f = self.opened_files.get_mut(&fh).unwrap();
+        // let f = self.opened_files.lock().await.get_mut(&fh).unwrap();
 
-        match if datasync {
-            f.sync_data()
-        } else {
-            f.sync_all()
-        } {
-            Err(e) => return reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                reply.ok();
-            }
-        }
+        // match if datasync {
+        //     f.sync_data()
+        // } else {
+        //     f.sync_all()
+        // } {
+        //     Err(e) => {reply.error(errhandle(e, || None).await); return;},
+        //     Ok(()) => {
+        //         reply.ok();
+        //     }
+        // }
     }
 
-    fn fsyncdir(
-        &mut self,
-        _req: &Request,
+    async fn fsyncdir(
+        &self,
+        _req: &Request<'_>,
         _ino: u64,
         _fh: u64,
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
         // I'm not sure how to do I with libstd
-        reply.ok();
+        // reply.ok();
+        todo!()
     }
 
-    fn release(
-        &mut self,
-        _req: &Request,
+    async fn release(
+        &self,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         _flags: i32,
@@ -419,24 +455,29 @@ impl Filesystem for XmpFS {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if !self.opened_files.contains_key(&fh) {
-            return reply.error(EIO);
-        }
 
-        self.opened_files.remove(&fh);
-        reply.ok();
+        match self.opened_files.lock().await.remove(&fh) {
+            Some(_) => {
+        reply.ok().await;
+
+            }
+            None => {
+                reply.error(EIO).await;
+
+            }
+        }
     }
 
-    fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        if !self.inode_to_path.contains_key(&ino) {
-            return reply.error(ENOENT);
+    async fn opendir(&self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
+        if !self.inode_to_path.lock().await.contains_key(&ino) {
+            return reply.error(ENOENT).await
         }
 
-        let entry_path = Path::new(&self.inode_to_path[&ino]).to_owned();
+        let entry_path = Path::new(&self.inode_to_path.lock().await[&ino]).to_owned();
 
         match std::fs::read_dir(&entry_path) {
             Err(e) => {
-                reply.error(errhandle(e, || ()));
+                reply.error(errhandle_no_cleanup(e).await).await;
             }
             Ok(x) => {
                 let mut v: Vec<DirInfo> = Vec::with_capacity(x.size_hint().0);
@@ -446,7 +487,7 @@ impl Filesystem for XmpFS {
                 } else {
                     match entry_path.parent() {
                         None => ino,
-                        Some(x) => *self.path_to_inode.get(x.as_os_str()).unwrap_or(&ino),
+                        Some(x) => *self.path_to_inode.lock().await.get(x.as_os_str()).unwrap_or(&ino),
                     }
                 };
 
@@ -464,41 +505,43 @@ impl Filesystem for XmpFS {
                 for dee in x {
                     match dee {
                         Err(e) => {
-                            reply.error(errhandle(e, || ()));
+                            reply.error(errhandle_no_cleanup(e).await).await;
                             return;
                         }
                         Ok(de) => {
                             let name = de.file_name().to_os_string();
                             let kind = de.file_type().map(ft2ft).unwrap_or(FileType::RegularFile);
                             let jp = entry_path.join(&name);
-                            let ino = self.add_or_create_inode(jp);
+                            let ino = self.add_or_create_inode(jp).await;
 
                             v.push(DirInfo { ino, kind, name });
                         }
                     }
                 }
-                let fh = self.counter;
-                self.opened_directories.insert(fh, v);
-                self.counter += 1;
-                reply.opened(fh, 0);
+                let fh = self.counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                self.opened_directories.lock().await.insert(fh, v);
+                reply.opened(fh, 0).await;
             }
         }
     }
 
-    fn readdir(
-        &mut self,
-        _req: &Request,
+    async fn readdir(
+        &self,
+        _req: &Request<'_>,
         _ino: u64,
         fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
-        if !self.opened_directories.contains_key(&fh) {
+        let handle = self.opened_directories.lock().await;
+        if !handle.contains_key(&fh) {
             error!("no fh {} for readdir", fh);
-            return reply.error(EIO);
+            return reply.error(EIO).await;
         }
 
-        let entries = &self.opened_directories[&fh];
+
+        let entries = &handle[&fh];
 
         for (i, entry) in entries.iter().enumerate().skip(offset as usize) {
             // i + 1 means the index of the next entry
@@ -506,125 +549,137 @@ impl Filesystem for XmpFS {
                 break;
             }
         }
-        reply.ok();
+        reply.ok().await
     }
 
 
-    fn releasedir(&mut self, _req: &Request, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
-        if !self.opened_directories.contains_key(&fh) {
-            return reply.error(EIO);
+    async fn releasedir(&self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
+        let mut handle = self.opened_directories.lock().await;
+        if !handle.contains_key(&fh) {
+            reply.error(EIO).await;
+            return;
         }
 
-        self.opened_directories.remove(&fh);
-        reply.ok();
+        handle.remove(&fh);
+        reply.ok().await;
     }
 
-    fn readlink(&mut self, _req: &Request, ino: u64, reply: ReplyData) {
-        if !self.inode_to_path.contains_key(&ino) {
-            return reply.error(ENOENT);
-        }
+    async fn readlink(&self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        todo!()
+        // if !self.inode_to_path.contains_key(&ino) {
+        //     return reply.error(ENOENT);
+        // }
 
-        let entry_path = Path::new(&self.inode_to_path[&ino]);
+        // let entry_path = Path::new(&self.inode_to_path[&ino]);
 
-        match std::fs::read_link(entry_path) {
-            Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(x) => {
-                reply.data(x.as_os_str().as_bytes());
-            }
-        }
+        // match std::fs::read_link(entry_path) {
+        //     Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
+        //     Ok(x) => {
+        //         reply.data(x.as_os_str().as_bytes());
+        //     }
+        // }
     }
 
-    fn mkdir(&mut self, _req: &Request, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
+    async fn mkdir(&self, _req: &Request<'_>, parent: u64, name: &OsStr, _mode: u32, _umask: u32, reply: ReplyEntry) {
+        todo!()
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
+        // if !self.inode_to_path.contains_key(&parent) {
+        //     return reply.error(ENOENT);
+        // }
 
-        let ino = self.add_or_create_inode(&entry_path);
-        match std::fs::create_dir(&entry_path) {
-            Err(e) => reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                let attr = match std::fs::symlink_metadata(entry_path) {
-                    Err(e) => {
-                        return reply.error(errhandle(e, || self.unregister_ino(ino)));
-                    }
-                    Ok(m) => meta2attr(&m, ino),
-                };
+        // let parent_path = Path::new(&self.inode_to_path[&parent]);
+        // let entry_path = parent_path.join(name);
 
-                reply.entry(&TTL, &attr, 1);
-            }
-        }
+        // let ino = self.add_or_create_inode(&entry_path);
+        // match std::fs::create_dir(&entry_path) {
+        //     Err(e) => reply.error(errhandle(e, || ())),
+        //     Ok(()) => {
+        //         let attr = match std::fs::symlink_metadata(entry_path) {
+        //             Err(e) => {
+        //                 return reply.error(errhandle(e, || self.unregister_ino(ino)));
+        //             }
+        //             Ok(m) => meta2attr(&m, ino),
+        //         };
+
+        //         reply.entry(&TTL, &attr, 1);
+        //     }
+        // }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
+    async fn unlink(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        todo!()
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
+        // if !self.inode_to_path.contains_key(&parent) {
+        //     return reply.error(ENOENT).await;
+        // }
 
-        match std::fs::remove_file(entry_path) {
-            Err(e) => reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                reply.ok();
-            }
-        }
+        // let parent_path = Path::new(&self.inode_to_path[&parent]);
+        // let entry_path = parent_path.join(name);
+
+        // match std::fs::remove_file(entry_path) {
+        //     Err(e) => reply.error(errhandle(e, || ())).await,
+        //     Ok(()) => {
+        //         reply.ok().await
+        //     }
+        // }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
+    async fn rmdir(&self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        todo!()
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
 
-        match std::fs::remove_dir(entry_path) {
-            Err(e) => reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                reply.ok();
-            }
-        }
+        // if !self.inode_to_path.contains_key(&parent) {
+        //     return reply.error(ENOENT);
+        // }
+
+        // let parent_path = Path::new(&self.inode_to_path[&parent]);
+        // let entry_path = parent_path.join(name);
+
+        // match std::fs::remove_dir(entry_path) {
+        //     Err(e) => reply.error(errhandle(e, || ())),
+        //     Ok(()) => {
+        //         reply.ok();
+        //     }
+        // }
     }
 
-    fn symlink(
-        &mut self,
-        _req: &Request,
+    async fn symlink(
+        &self,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         link: &Path,
         reply: ReplyEntry,
     ) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
+        todo!()
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let entry_path = parent_path.join(name);
-        let ino = self.add_or_create_inode(&entry_path);
+        // if !self.inode_to_path.contains_key(&parent) {
+        //     return reply.error(ENOENT);
+        // }
 
-        match std::os::unix::fs::symlink(&entry_path, link) {
-            Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(()) => {
-                let attr = match std::fs::symlink_metadata(entry_path) {
-                    Err(e) => {
-                        return reply.error(errhandle(e, || self.unregister_ino(ino)));
-                    }
-                    Ok(m) => meta2attr(&m, ino),
-                };
+        // let parent_path = Path::new(&self.inode_to_path[&parent]);
+        // let entry_path = parent_path.join(name);
+        // let ino = self.add_or_create_inode(&entry_path);
 
-                reply.entry(&TTL, &attr, 1);
-            }
-        }
+        // match std::os::unix::fs::symlink(&entry_path, link) {
+        //     Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
+        //     Ok(()) => {
+        //         let attr = match std::fs::symlink_metadata(entry_path) {
+        //             Err(e) => {
+        //                 return reply.error(errhandle(e, || self.unregister_ino(ino)));
+        //             }
+        //             Ok(m) => meta2attr(&m, ino),
+        //         };
+
+        //         reply.entry(&TTL, &attr, 1);
+        //     }
+        // }
     }
 
 
-    fn rename(
-        &mut self,
-        _req: &Request,
+    async fn rename(
+        &self,
+        _req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -633,195 +688,198 @@ impl Filesystem for XmpFS {
 
         reply: ReplyEmpty,
     ) {
-        if !self.inode_to_path.contains_key(&parent) {
-            return reply.error(ENOENT);
-        }
-        if !self.inode_to_path.contains_key(&newparent) {
-            return reply.error(ENOENT);
-        }
+        todo!()
 
-        let parent_path = Path::new(&self.inode_to_path[&parent]);
-        let newparent_path = Path::new(&self.inode_to_path[&newparent]);
-        let entry_path = parent_path.join(name);
-        let newentry_path = newparent_path.join(newname);
+        // if !self.inode_to_path.contains_key(&parent) {
+        //     return reply.error(ENOENT);
+        // }
+        // if !self.inode_to_path.contains_key(&newparent) {
+        //     return reply.error(ENOENT);
+        // }
 
-        if entry_path == newentry_path {
-            return reply.ok();
-        }
+        // let parent_path = Path::new(&self.inode_to_path[&parent]);
+        // let newparent_path = Path::new(&self.inode_to_path[&newparent]);
+        // let entry_path = parent_path.join(name);
+        // let newentry_path = newparent_path.join(newname);
 
-        let ino = self.add_or_create_inode(&entry_path);
+        // if entry_path == newentry_path {
+        //     return reply.ok();
+        // }
 
-        match std::fs::rename(&entry_path, &newentry_path) {
-            Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(()) => {
-                self.inode_to_path
-                    .insert(ino, newentry_path.as_os_str().to_os_string());
-                self.path_to_inode.remove(entry_path.as_os_str());
-                self.path_to_inode
-                    .insert(newentry_path.as_os_str().to_os_string(), ino);
-                reply.ok();
-            }
-        }
+        // let ino = self.add_or_create_inode(&entry_path);
+
+        // match std::fs::rename(&entry_path, &newentry_path) {
+        //     Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
+        //     Ok(()) => {
+        //         self.inode_to_path
+        //             .insert(ino, newentry_path.as_os_str().to_os_string());
+        //         self.path_to_inode.remove(entry_path.as_os_str());
+        //         self.path_to_inode
+        //             .insert(newentry_path.as_os_str().to_os_string(), ino);
+        //         reply.ok();
+        //     }
+        // }
     }
 
-    fn link(
-        &mut self,
-        _req: &Request,
+    async fn link(
+        &self,
+        _req: &Request<'_>,
         ino: u64,
         newparent: u64,
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
         // Not a true hardlink: new inode
+todo!()
+        // if !self.inode_to_path.contains_key(&ino) {
+        //     return reply.error(ENOENT);
+        // }
+        // if !self.inode_to_path.contains_key(&newparent) {
+        //     return reply.error(ENOENT);
+        // }
 
-        if !self.inode_to_path.contains_key(&ino) {
-            return reply.error(ENOENT);
-        }
-        if !self.inode_to_path.contains_key(&newparent) {
-            return reply.error(ENOENT);
-        }
+        // let entry_path = Path::new(&self.inode_to_path[&ino]).to_owned();
+        // let newparent_path = Path::new(&self.inode_to_path[&newparent]);
+        // let newentry_path = newparent_path.join(newname);
 
-        let entry_path = Path::new(&self.inode_to_path[&ino]).to_owned();
-        let newparent_path = Path::new(&self.inode_to_path[&newparent]);
-        let newentry_path = newparent_path.join(newname);
+        // let newino = self.add_or_create_inode(&newentry_path);
 
-        let newino = self.add_or_create_inode(&newentry_path);
+        // match std::fs::hard_link(&entry_path, &newentry_path) {
+        //     Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
+        //     Ok(()) => {
+        //         let attr = match std::fs::symlink_metadata(newentry_path) {
+        //             Err(e) => {
+        //                 return reply.error(errhandle(e, || self.unregister_ino(newino)));
+        //             }
+        //             Ok(m) => meta2attr(&m, newino),
+        //         };
 
-        match std::fs::hard_link(&entry_path, &newentry_path) {
-            Err(e) => reply.error(errhandle(e, || self.unregister_ino(ino))),
-            Ok(()) => {
-                let attr = match std::fs::symlink_metadata(newentry_path) {
-                    Err(e) => {
-                        return reply.error(errhandle(e, || self.unregister_ino(newino)));
-                    }
-                    Ok(m) => meta2attr(&m, newino),
-                };
-
-                reply.entry(&TTL, &attr, 1);
-            }
-        }
+        //         reply.entry(&TTL, &attr, 1);
+        //     }
+        // }
     }
 
 
 
-    fn mknod(
-        &mut self,
-        _req: &Request,
-        _parent: u64,
-        _name: &OsStr,
-        _mode: u32,
-        _umask: u32,
-        _rdev: u32,
-        reply: ReplyEntry,
-    ) {
-        // no mknod lib libstd
-        reply.error(ENOSYS);
-    }
+    // async fn mknod(
+    //     &self,
+    //     _req: &Request<'_>,
+    //     _parent: u64,
+    //     _name: &OsStr,
+    //     _mode: u32,
+    //     _umask: u32,
+    //     _rdev: u32,
+    //     reply: ReplyEntry,
+    // ) {
+    //     // no mknod lib libstd
+    //     reply.error(ENOSYS);
+    // }
 
 
 
-    fn setattr(
-        &mut self,
-        _req: &Request<'_>,
-        ino: u64,
-        mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
-        size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
-        _ctime: Option<SystemTime>,
-        fh: Option<u64>,
-        _crtime: Option<SystemTime>,
-        _chgtime: Option<SystemTime>,
-        _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
-        reply: ReplyAttr,
-    ) {
-        // Limited to setting file length only
+    // async fn setattr(
+    //     &self,
+    //     _req: &Request<'_>,
+    //     ino: u64,
+    //     mode: Option<u32>,
+    //     _uid: Option<u32>,
+    //     _gid: Option<u32>,
+    //     size: Option<u64>,
+    //     _atime: Option<TimeOrNow>,
+    //     _mtime: Option<TimeOrNow>,
+    //     _ctime: Option<SystemTime>,
+    //     fh: Option<u64>,
+    //     _crtime: Option<SystemTime>,
+    //     _chgtime: Option<SystemTime>,
+    //     _bkuptime: Option<SystemTime>,
+    //     _flags: Option<u32>,
+    //     reply: ReplyAttr,
+    // ) {
+    //     // Limited to setting file length only
 
-        let (fh, sz) = match (fh, size) {
-            (Some(x), Some(y)) => (x, y),
-            _ => {
-                // only partial for chmod +x, and not the good one
+    //     let (fh, sz) = match (fh, size) {
+    //         (Some(x), Some(y)) => (x, y),
+    //         _ => {
+    //             // only partial for chmod +x, and not the good one
 
-                let entry_path = Path::new(&self.inode_to_path[&ino]).to_owned();
+    //             let entry_path = Path::new(&self.inode_to_path[&ino]).to_owned();
 
-                if let Some(mode) = mode {
-                    use std::fs::Permissions;
+    //             if let Some(mode) = mode {
+    //                 use std::fs::Permissions;
 
-                    let perm = Permissions::from_mode(mode);
-                    match std::fs::set_permissions(&entry_path, perm) {
-                        Err(e) => return reply.error(errhandle(e, || self.unregister_ino(ino))),
-                        Ok(()) => {
-                            let attr = match std::fs::symlink_metadata(entry_path) {
-                                Err(e) => {
-                                    return reply.error(errhandle(e, || self.unregister_ino(ino)));
-                                }
-                                Ok(m) => meta2attr(&m, ino),
-                            };
+    //                 let perm = Permissions::from_mode(mode);
+    //                 match std::fs::set_permissions(&entry_path, perm) {
+    //                     Err(e) => return reply.error(errhandle(e, || self.unregister_ino(ino))),
+    //                     Ok(()) => {
+    //                         let attr = match std::fs::symlink_metadata(entry_path) {
+    //                             Err(e) => {
+    //                                 return reply.error(errhandle(e, || self.unregister_ino(ino)));
+    //                             }
+    //                             Ok(m) => meta2attr(&m, ino),
+    //                         };
 
-                            return reply.attr(&TTL, &attr);
-                        }
-                    }
-                } else {
-                    // Just try to do nothing, successfully.
-                    let attr = match std::fs::symlink_metadata(entry_path) {
-                        Err(e) => {
-                            return reply.error(errhandle(e, || self.unregister_ino(ino)));
-                        }
-                        Ok(m) => meta2attr(&m, ino),
-                    };
+    //                         return reply.attr(&TTL, &attr);
+    //                     }
+    //                 }
+    //             } else {
+    //                 // Just try to do nothing, successfully.
+    //                 let attr = match std::fs::symlink_metadata(entry_path) {
+    //                     Err(e) => {
+    //                         return reply.error(errhandle(e, || self.unregister_ino(ino)));
+    //                     }
+    //                     Ok(m) => meta2attr(&m, ino),
+    //                 };
 
-                    return reply.attr(&TTL, &attr);
-                }
-            }
-        };
+    //                 return reply.attr(&TTL, &attr);
+    //             }
+    //         }
+    //     };
 
-        if !self.opened_files.contains_key(&fh) {
-            return reply.error(EIO);
-        }
+    //     if !self.opened_files.contains_key(&fh) {
+    //         return reply.error(EIO);
+    //     }
 
-        let f = self.opened_files.get_mut(&fh).unwrap();
+    //     let f = self.opened_files.get_mut(&fh).unwrap();
 
-        match f.set_len(sz) {
-            Err(e) => reply.error(errhandle(e, || ())),
-            Ok(()) => {
-                // pull regular file metadata out of thin air
+    //     match f.set_len(sz) {
+    //         Err(e) => reply.error(errhandle(e, || ())),
+    //         Ok(()) => {
+    //             // pull regular file metadata out of thin air
 
-                let attr = FileAttr {
-                    ino,
-                    size: sz,
-                    blocks: 1,
-                    atime: UNIX_EPOCH,
-                    mtime: UNIX_EPOCH,
-                    ctime: UNIX_EPOCH,
-                    crtime: UNIX_EPOCH,
-                    kind: FileType::RegularFile,
-                    perm: 0o644,
-                    nlink: 1,
-                    uid: 0,
-                    gid: 0,
-                    rdev: 0,
-                    flags: 0,
-                    blksize: sz as u32,
-                    padding: 0,
-                };
+    //             let attr = FileAttr {
+    //                 ino,
+    //                 size: sz,
+    //                 blocks: 1,
+    //                 atime: UNIX_EPOCH,
+    //                 mtime: UNIX_EPOCH,
+    //                 ctime: UNIX_EPOCH,
+    //                 crtime: UNIX_EPOCH,
+    //                 kind: FileType::RegularFile,
+    //                 perm: 0o644,
+    //                 nlink: 1,
+    //                 uid: 0,
+    //                 gid: 0,
+    //                 rdev: 0,
+    //                 flags: 0,
+    //                 blksize: sz as u32,
+    //                 padding: 0,
+    //             };
 
-                reply.attr(&TTL, &attr);
-            }
-        }
-    }
+    //             reply.attr(&TTL, &attr);
+    //         }
+    //     }
+    // }
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
     let mountpoint = env::args_os().nth(1).unwrap();
-    let options = ["-o", "rw,default_permissions", "-o", "fsname=xmp"]
+    let options = ["-o", "rw,default_permissions", "-o", "fsname=xmp,async"]
         .iter()
         .map(|o| o.as_ref())
         .collect::<Vec<&OsStr>>();
     let mut xmp = XmpFS::new();
-    xmp.populate_root_dir();
-    fuser::mount(xmp, mountpoint, &options).unwrap();
+    xmp.populate_root_dir().await;
+    fuser::mount(xmp, mountpoint, &options).await.unwrap();
 }
