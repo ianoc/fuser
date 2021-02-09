@@ -5,19 +5,18 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
-use crate::fuse_abi::consts::*;
 use crate::fuse_abi::*;
+use crate::{fuse_abi::consts::*, session::ActiveSession};
 use libc::{EIO, ENOSYS, EPROTO};
 use log::{debug, error, warn};
-use std::convert::TryFrom;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
+use std::{convert::TryFrom, sync::Arc};
 
 use crate::channel::ChannelSender;
 #[cfg(feature = "abi-7-21")]
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplyEmpty, ReplyRaw};
-use crate::session::Session;
 use crate::Filesystem;
 use crate::TimeOrNow::{Now, SpecificTime};
 use crate::{ll, KernelConfig};
@@ -33,18 +32,18 @@ fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
 /// Request data structure
 #[derive(Debug)]
 pub struct Request<'a> {
-    /// Channel sender for sending the reply
-    ch: ChannelSender,
     /// Request raw data
-    data: &'a [u8],
+    pub data: Vec<u8>,
     /// Parsed request
-    request: ll::Request<'a>,
+    pub request: ll::Request<'a>,
 }
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
-    pub fn new(ch: ChannelSender, data: &'a [u8]) -> Option<Request<'a>> {
-        let request = match ll::Request::try_from(data) {
+    pub fn new(data: Vec<u8>) -> Option<Request<'a>> {
+        let buffer_ptr: &[u8] = unsafe { &*(data.as_ref() as *const [u8]) };
+
+        let request = match ll::Request::try_from(buffer_ptr) {
             Ok(request) => request,
             Err(err) => {
                 // FIXME: Reply with ENOSYS?
@@ -53,34 +52,41 @@ impl<'a> Request<'a> {
             }
         };
 
-        Some(Self { ch, data, request })
+        Some(Self { data, request })
     }
 
-    /// Dispatch request to the given filesystem.
-    /// This calls the appropriate filesystem operation method for the
-    /// request and sends back the returned reply to the kernel
-    pub fn dispatch<FS: Filesystem>(&self, se: &mut Session<FS>) {
+    pub(crate) async fn dispatch_init<FS: Filesystem>(
+        &self,
+        se: &Arc<ActiveSession>,
+        filesystem: &Arc<FS>,
+        ch: ChannelSender,
+    ) -> () {
         debug!("{}", self.request);
-
         match self.request.operation() {
             // Filesystem initialization
             ll::Operation::Init { arg } => {
-                let reply: ReplyRaw<fuse_init_out> = self.reply();
+                let reply: ReplyRaw<fuse_init_out> = self.reply(&ch);
                 // We don't support ABI versions before 7.6
                 if arg.major < 7 || (arg.major == 7 && arg.minor < 6) {
                     error!("Unsupported FUSE ABI version {}.{}", arg.major, arg.minor);
-                    reply.error(EPROTO);
+                    reply.error(EPROTO).await;
+                    se.destroyed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
+
+                let mut cfg = se.session_configuration.lock().await;
                 // Remember ABI version supported by kernel
-                se.proto_major = arg.major;
-                se.proto_minor = arg.minor;
+                cfg.proto_major = arg.major;
+                cfg.proto_minor = arg.minor;
 
                 let mut config = KernelConfig::new(arg.flags, arg.max_readahead);
                 // Call filesystem init method and give it a chance to return an error
-                let res = se.filesystem.init(self, &mut config);
+                let res = filesystem.init(self, &mut config).await;
                 if let Err(err) = res {
-                    reply.error(err);
+                    reply.error(err).await;
+                    se.destroyed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     return;
                 }
                 // Reply with our desired version and settings. If the kernel supports a
@@ -113,42 +119,76 @@ impl<'a> Request<'a> {
                     "INIT response: ABI {}.{}, flags {:#x}, max readahead {}, max write {}",
                     init.major, init.minor, init.flags, init.max_readahead, init.max_write
                 );
-                se.initialized = true;
-                reply.ok(&init);
+                se.initialized
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                reply.ok(&init).await;
             }
             // Any operation is invalid before initialization
-            _ if !se.initialized => {
+            _ => {
                 warn!("Ignoring FUSE operation before init: {}", self.request);
-                self.reply::<ReplyEmpty>().error(EIO);
+                self.reply::<ReplyEmpty>(&ch).error(EIO).await;
             }
+        }
+    }
+
+    pub(crate) async fn maybe_destroy_dispatch(
+        &self,
+        active_session: &Arc<ActiveSession>,
+        ch: ChannelSender,
+    ) -> bool {
+        debug!("{}", self.request);
+        match self.request.operation() {
             // Filesystem destroyed
             ll::Operation::Destroy => {
-                se.filesystem.destroy(self);
-                se.destroyed = true;
-                self.reply::<ReplyEmpty>().ok();
+                active_session
+                    .destroyed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                self.reply::<ReplyEmpty>(&ch).ok().await;
+                true
             }
-            // Any operation is invalid after destroy
-            _ if se.destroyed => {
-                warn!("Ignoring FUSE operation after destroy: {}", self.request);
-                self.reply::<ReplyEmpty>().error(EIO);
+            _ => false,
+        }
+    }
+    /// Dispatch request to the given filesystem.
+    /// This calls the appropriate filesystem operation method for the
+    /// request and sends back the returned reply to the kernel
+    pub(crate) async fn dispatch<FS: Filesystem>(
+        &self,
+        filesystem: Arc<FS>,
+        ch: ChannelSender,
+    ) -> std::io::Result<()> {
+        debug!("{}", self.request);
+
+        match self.request.operation() {
+            // Filesystem initialization
+            ll::Operation::Init { arg: _arg } => {
+                warn!(
+                    "Already initialized, got init after init init: {}",
+                    self.request
+                );
+                self.reply::<ReplyEmpty>(&ch).error(EIO).await;
             }
 
             ll::Operation::Interrupt { .. } => {
                 // TODO: handle FUSE_INTERRUPT
-                self.reply::<ReplyEmpty>().error(ENOSYS);
+                self.reply::<ReplyEmpty>(&ch).error(ENOSYS).await;
             }
 
             ll::Operation::Lookup { name } => {
-                se.filesystem
-                    .lookup(self, self.request.nodeid(), &name, self.reply());
+                filesystem
+                    .lookup(self, self.request.nodeid(), &name, self.reply(&ch))
+                    .await
             }
             ll::Operation::Forget { arg } => {
-                se.filesystem
-                    .forget(self, self.request.nodeid(), arg.nlookup); // no reply
+                filesystem
+                    .forget(self, self.request.nodeid(), arg.nlookup)
+                    .await; // no reply
             }
             ll::Operation::GetAttr => {
-                se.filesystem
-                    .getattr(self, self.request.nodeid(), self.reply());
+                filesystem
+                    .getattr(self, self.request.nodeid(), self.reply(&ch))
+                    .await;
             }
             ll::Operation::SetAttr { arg } => {
                 let mode = match arg.valid & FATTR_MODE {
@@ -241,242 +281,296 @@ impl<'a> Request<'a> {
                     (None, None, None, None)
                 }
                 let (crtime, chgtime, bkuptime, flags) = get_macos_setattr(arg);
-                se.filesystem.setattr(
-                    self,
-                    self.request.nodeid(),
-                    mode,
-                    uid,
-                    gid,
-                    size,
-                    atime,
-                    mtime,
-                    ctime,
-                    fh,
-                    crtime,
-                    chgtime,
-                    bkuptime,
-                    flags,
-                    self.reply(),
-                );
+                filesystem
+                    .setattr(
+                        self,
+                        self.request.nodeid(),
+                        mode,
+                        uid,
+                        gid,
+                        size,
+                        atime,
+                        mtime,
+                        ctime,
+                        fh,
+                        crtime,
+                        chgtime,
+                        bkuptime,
+                        flags,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::ReadLink => {
-                se.filesystem
-                    .readlink(self, self.request.nodeid(), self.reply());
+                filesystem
+                    .readlink(self, self.request.nodeid(), self.reply(&ch))
+                    .await;
             }
             ll::Operation::MkNod { arg, name } => {
                 #[cfg(not(feature = "abi-7-12"))]
-                se.filesystem.mknod(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    0,
-                    arg.rdev,
-                    self.reply(),
-                );
+                filesystem
+                    .mknod(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        0,
+                        arg.rdev,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-12")]
-                se.filesystem.mknod(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    arg.umask,
-                    arg.rdev,
-                    self.reply(),
-                );
+                filesystem
+                    .mknod(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        arg.umask,
+                        arg.rdev,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::MkDir { arg, name } => {
                 #[cfg(not(feature = "abi-7-12"))]
-                se.filesystem.mkdir(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    0,
-                    self.reply(),
-                );
+                filesystem
+                    .mkdir(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        0,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-12")]
-                se.filesystem.mkdir(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    arg.umask,
-                    self.reply(),
-                );
+                filesystem
+                    .mkdir(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        arg.umask,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Unlink { name } => {
-                se.filesystem
-                    .unlink(self, self.request.nodeid(), &name, self.reply());
+                filesystem
+                    .unlink(self, self.request.nodeid(), &name, self.reply(&ch))
+                    .await;
             }
             ll::Operation::RmDir { name } => {
-                se.filesystem
-                    .rmdir(self, self.request.nodeid(), &name, self.reply());
+                filesystem
+                    .rmdir(self, self.request.nodeid(), &name, self.reply(&ch))
+                    .await;
             }
             ll::Operation::SymLink { name, link } => {
-                se.filesystem.symlink(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    &Path::new(link),
-                    self.reply(),
-                );
+                filesystem
+                    .symlink(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        &Path::new(link),
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Rename { arg, name, newname } => {
-                se.filesystem.rename(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.newdir,
-                    &newname,
-                    0,
-                    self.reply(),
-                );
+                filesystem
+                    .rename(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.newdir,
+                        &newname,
+                        0,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Link { arg, name } => {
-                se.filesystem.link(
-                    self,
-                    arg.oldnodeid,
-                    self.request.nodeid(),
-                    &name,
-                    self.reply(),
-                );
+                filesystem
+                    .link(
+                        self,
+                        arg.oldnodeid,
+                        self.request.nodeid(),
+                        &name,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Open { arg } => {
-                se.filesystem
-                    .open(self, self.request.nodeid(), arg.flags, self.reply());
+                filesystem
+                    .open(self, self.request.nodeid(), arg.flags, self.reply(&ch))
+                    .await;
             }
             ll::Operation::Read { arg } => {
                 #[cfg(not(feature = "abi-7-9"))]
-                se.filesystem.read(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset as i64,
-                    arg.size,
-                    0,
-                    None,
-                    self.reply(),
-                );
+                filesystem
+                    .read(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset as i64,
+                        arg.size,
+                        0,
+                        None,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-9")]
-                se.filesystem.read(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset as i64,
-                    arg.size,
-                    arg.flags,
-                    if arg.read_flags & FUSE_READ_LOCKOWNER != 0 {
-                        Some(arg.lock_owner)
-                    } else {
-                        None
-                    },
-                    self.reply(),
-                );
+                filesystem
+                    .read(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset as i64,
+                        arg.size,
+                        arg.flags,
+                        if arg.read_flags & FUSE_READ_LOCKOWNER != 0 {
+                            Some(arg.lock_owner)
+                        } else {
+                            None
+                        },
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Write { arg, data } => {
                 assert!(data.len() == arg.size as usize);
 
                 #[cfg(not(feature = "abi-7-9"))]
-                se.filesystem.write(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset as i64,
-                    data,
-                    arg.write_flags,
-                    0,
-                    None,
-                    self.reply(),
-                );
+                filesystem
+                    .write(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset as i64,
+                        data,
+                        arg.write_flags,
+                        0,
+                        None,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-9")]
-                se.filesystem.write(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset as i64,
-                    data,
-                    arg.write_flags,
-                    arg.flags,
-                    if arg.write_flags & FUSE_WRITE_LOCKOWNER != 0 {
-                        Some(arg.lock_owner)
-                    } else {
-                        None
-                    },
-                    self.reply(),
-                );
+                filesystem
+                    .write(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset as i64,
+                        data,
+                        arg.write_flags,
+                        arg.flags,
+                        if arg.write_flags & FUSE_WRITE_LOCKOWNER != 0 {
+                            Some(arg.lock_owner)
+                        } else {
+                            None
+                        },
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Flush { arg } => {
-                se.filesystem.flush(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.lock_owner,
-                    self.reply(),
-                );
+                filesystem
+                    .flush(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.lock_owner,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::Release { arg } => {
                 let flush = !matches!(arg.release_flags & FUSE_RELEASE_FLUSH, 0);
                 #[cfg(not(feature = "abi-7-17"))]
-                se.filesystem.release(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.flags,
-                    Some(arg.lock_owner),
-                    flush,
-                    self.reply(),
-                );
+                filesystem
+                    .release(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.flags,
+                        Some(arg.lock_owner),
+                        flush,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-17")]
-                se.filesystem.release(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.flags,
-                    if arg.release_flags & FUSE_RELEASE_FLOCK_UNLOCK != 0 {
-                        Some(arg.lock_owner)
-                    } else {
-                        None
-                    },
-                    flush,
-                    self.reply(),
-                );
+                filesystem
+                    .release(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.flags,
+                        if arg.release_flags & FUSE_RELEASE_FLOCK_UNLOCK != 0 {
+                            Some(arg.lock_owner)
+                        } else {
+                            None
+                        },
+                        flush,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::FSync { arg } => {
                 let datasync = !matches!(arg.fsync_flags & 1, 0);
-                se.filesystem
-                    .fsync(self, self.request.nodeid(), arg.fh, datasync, self.reply());
+                filesystem
+                    .fsync(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        datasync,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::OpenDir { arg } => {
-                se.filesystem
-                    .opendir(self, self.request.nodeid(), arg.flags, self.reply());
+                filesystem
+                    .opendir(self, self.request.nodeid(), arg.flags, self.reply(&ch))
+                    .await;
             }
             ll::Operation::ReadDir { arg } => {
-                se.filesystem.readdir(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset as i64,
-                    ReplyDirectory::new(self.request.unique(), self.ch, arg.size as usize),
-                );
+                filesystem
+                    .readdir(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset as i64,
+                        ReplyDirectory::new(self.request.unique(), ch.clone(), arg.size as usize),
+                    )
+                    .await;
             }
             ll::Operation::ReleaseDir { arg } => {
-                se.filesystem.releasedir(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.flags,
-                    self.reply(),
-                );
+                filesystem
+                    .releasedir(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.flags,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::FSyncDir { arg } => {
                 let datasync = !matches!(arg.fsync_flags & 1, 0);
-                se.filesystem
-                    .fsyncdir(self, self.request.nodeid(), arg.fh, datasync, self.reply());
+                filesystem
+                    .fsyncdir(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        datasync,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::StatFs => {
-                se.filesystem
-                    .statfs(self, self.request.nodeid(), self.reply());
+                filesystem
+                    .statfs(self, self.request.nodeid(), self.reply(&ch))
+                    .await;
             }
             ll::Operation::SetXAttr { arg, name, value } => {
                 assert!(value.len() == arg.size as usize);
@@ -490,205 +584,234 @@ impl<'a> Request<'a> {
                 fn get_position(_arg: &fuse_setxattr_in) -> u32 {
                     0
                 }
-                se.filesystem.setxattr(
-                    self,
-                    self.request.nodeid(),
-                    name,
-                    value,
-                    arg.flags,
-                    get_position(arg),
-                    self.reply(),
-                );
+                filesystem
+                    .setxattr(
+                        self,
+                        self.request.nodeid(),
+                        name,
+                        value,
+                        arg.flags,
+                        get_position(arg),
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::GetXAttr { arg, name } => {
-                se.filesystem
-                    .getxattr(self, self.request.nodeid(), name, arg.size, self.reply());
+                filesystem
+                    .getxattr(self, self.request.nodeid(), name, arg.size, self.reply(&ch))
+                    .await;
             }
             ll::Operation::ListXAttr { arg } => {
-                se.filesystem
-                    .listxattr(self, self.request.nodeid(), arg.size, self.reply());
+                filesystem
+                    .listxattr(self, self.request.nodeid(), arg.size, self.reply(&ch))
+                    .await;
             }
             ll::Operation::RemoveXAttr { name } => {
-                se.filesystem
-                    .removexattr(self, self.request.nodeid(), name, self.reply());
+                filesystem
+                    .removexattr(self, self.request.nodeid(), name, self.reply(&ch))
+                    .await;
             }
             ll::Operation::Access { arg } => {
-                se.filesystem
-                    .access(self, self.request.nodeid(), arg.mask, self.reply());
+                filesystem
+                    .access(self, self.request.nodeid(), arg.mask, self.reply(&ch))
+                    .await;
             }
             ll::Operation::Create { arg, name } => {
                 #[cfg(not(feature = "abi-7-12"))]
-                se.filesystem.create(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    0,
-                    arg.flags,
-                    self.reply(),
-                );
+                filesystem
+                    .create(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        0,
+                        arg.flags,
+                        self.reply(&ch),
+                    )
+                    .await;
                 #[cfg(feature = "abi-7-12")]
-                se.filesystem.create(
-                    self,
-                    self.request.nodeid(),
-                    &name,
-                    arg.mode,
-                    arg.umask,
-                    arg.flags,
-                    self.reply(),
-                );
+                filesystem
+                    .create(
+                        self,
+                        self.request.nodeid(),
+                        &name,
+                        arg.mode,
+                        arg.umask,
+                        arg.flags,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::GetLk { arg } => {
-                se.filesystem.getlk(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.owner,
-                    arg.lk.start,
-                    arg.lk.end,
-                    arg.lk.typ,
-                    arg.lk.pid,
-                    self.reply(),
-                );
+                filesystem
+                    .getlk(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.owner,
+                        arg.lk.start,
+                        arg.lk.end,
+                        arg.lk.typ,
+                        arg.lk.pid,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::SetLk { arg } => {
-                se.filesystem.setlk(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.owner,
-                    arg.lk.start,
-                    arg.lk.end,
-                    arg.lk.typ,
-                    arg.lk.pid,
-                    false,
-                    self.reply(),
-                );
+                filesystem
+                    .setlk(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.owner,
+                        arg.lk.start,
+                        arg.lk.end,
+                        arg.lk.typ,
+                        arg.lk.pid,
+                        false,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::SetLkW { arg } => {
-                se.filesystem.setlk(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.owner,
-                    arg.lk.start,
-                    arg.lk.end,
-                    arg.lk.typ,
-                    arg.lk.pid,
-                    true,
-                    self.reply(),
-                );
+                filesystem
+                    .setlk(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.owner,
+                        arg.lk.start,
+                        arg.lk.end,
+                        arg.lk.typ,
+                        arg.lk.pid,
+                        true,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             ll::Operation::BMap { arg } => {
-                se.filesystem.bmap(
-                    self,
-                    self.request.nodeid(),
-                    arg.blocksize,
-                    arg.block,
-                    self.reply(),
-                );
+                filesystem
+                    .bmap(
+                        self,
+                        self.request.nodeid(),
+                        arg.blocksize,
+                        arg.block,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
 
             #[cfg(feature = "abi-7-11")]
             ll::Operation::IoCtl { arg, data } => {
                 let in_data = &data[..arg.in_size as usize];
                 if (arg.flags & FUSE_IOCTL_UNRESTRICTED) > 0 {
-                    self.reply::<ReplyEmpty>().error(ENOSYS);
+                    self.reply::<ReplyEmpty>(&ch).error(ENOSYS).await;
                 } else {
-                    se.filesystem.ioctl(
-                        self,
-                        self.request.nodeid(),
-                        arg.fh,
-                        arg.flags,
-                        arg.cmd,
-                        in_data,
-                        arg.out_size,
-                        self.reply(),
-                    );
+                    filesystem
+                        .ioctl(
+                            self,
+                            self.request.nodeid(),
+                            arg.fh,
+                            arg.flags,
+                            arg.cmd,
+                            in_data,
+                            arg.out_size,
+                            self.reply(&ch),
+                        )
+                        .await;
                 }
             }
             #[cfg(feature = "abi-7-11")]
             ll::Operation::Poll { arg: _ } => {
                 // TODO: handle FUSE_POLL
-                self.reply::<ReplyEmpty>().error(ENOSYS);
+                self.reply::<ReplyEmpty>(&ch).error(ENOSYS).await;
             }
             #[cfg(feature = "abi-7-15")]
             ll::Operation::NotifyReply { data: _ } => {
                 // TODO: handle FUSE_NOTIFY_REPLY
-                self.reply::<ReplyEmpty>().error(ENOSYS);
+                self.reply::<ReplyEmpty>(&ch).error(ENOSYS).await;
             }
             #[cfg(feature = "abi-7-16")]
             ll::Operation::BatchForget { arg: _, nodes } => {
-                se.filesystem.batch_forget(self, nodes); // no reply
+                filesystem.batch_forget(self, nodes).await; // no reply
             }
             #[cfg(feature = "abi-7-19")]
             ll::Operation::FAllocate { arg } => {
-                se.filesystem.fallocate(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset,
-                    arg.length,
-                    arg.mode,
-                    self.reply(),
-                );
+                filesystem
+                    .fallocate(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset,
+                        arg.length,
+                        arg.mode,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             #[cfg(feature = "abi-7-21")]
             ll::Operation::ReadDirPlus { arg } => {
-                se.filesystem.readdirplus(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset,
-                    ReplyDirectoryPlus::new(self.request.unique(), self.ch, arg.size as usize),
-                );
+                filesystem
+                    .readdirplus(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset,
+                        ReplyDirectoryPlus::new(self.request.unique(), ch, arg.size as usize),
+                    )
+                    .await;
             }
             #[cfg(feature = "abi-7-23")]
             ll::Operation::Rename2 { arg, name, newname } => {
-                se.filesystem.rename(
-                    self,
-                    self.request.nodeid(),
-                    name,
-                    arg.newdir,
-                    newname,
-                    arg.flags,
-                    self.reply(),
-                );
+                filesystem
+                    .rename(
+                        self,
+                        self.request.nodeid(),
+                        name,
+                        arg.newdir,
+                        newname,
+                        arg.flags,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             #[cfg(feature = "abi-7-24")]
             ll::Operation::Lseek { arg } => {
-                se.filesystem.lseek(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh,
-                    arg.offset,
-                    arg.whence,
-                    self.reply(),
-                );
+                filesystem
+                    .lseek(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh,
+                        arg.offset,
+                        arg.whence,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             #[cfg(feature = "abi-7-28")]
             ll::Operation::CopyFileRange { arg } => {
-                se.filesystem.copy_file_range(
-                    self,
-                    self.request.nodeid(),
-                    arg.fh_in,
-                    arg.off_in,
-                    arg.nodeid_out,
-                    arg.fh_out,
-                    arg.off_out,
-                    arg.len,
-                    arg.flags as u32,
-                    self.reply(),
-                );
+                filesystem
+                    .copy_file_range(
+                        self,
+                        self.request.nodeid(),
+                        arg.fh_in,
+                        arg.off_in,
+                        arg.nodeid_out,
+                        arg.fh_out,
+                        arg.off_out,
+                        arg.len,
+                        arg.flags as u32,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName { name } => {
-                se.filesystem.setvolname(self, name, self.reply());
+                filesystem.setvolname(self, name, self.reply(&ch));
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes => {
-                se.filesystem
-                    .getxtimes(self, self.request.nodeid(), self.reply());
+                filesystem.getxtimes(self, self.request.nodeid(), self.reply(&ch));
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange {
@@ -696,29 +819,34 @@ impl<'a> Request<'a> {
                 oldname,
                 newname,
             } => {
-                se.filesystem.exchange(
+                filesystem.exchange(
                     self,
                     arg.olddir,
                     &oldname,
                     arg.newdir,
                     &newname,
                     arg.options,
-                    self.reply(),
+                    self.reply(&ch),
                 );
             }
 
             #[cfg(feature = "abi-7-12")]
             ll::Operation::CuseInit { arg: _ } => {
                 // TODO: handle CUSE_INIT
-                self.reply::<ReplyEmpty>().error(ENOSYS);
+                self.reply::<ReplyEmpty>(&ch).error(ENOSYS).await;
+            }
+
+            ll::Operation::Destroy => {
+                unreachable!()
             }
         }
+        Ok(())
     }
 
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
-    fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique(), self.ch)
+    fn reply<T: Reply>(&self, ch: &ChannelSender) -> T {
+        Reply::new(self.request.unique(), ch.clone())
     }
 
     /// Returns the unique identifier of this request

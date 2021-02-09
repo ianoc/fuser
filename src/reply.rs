@@ -15,6 +15,8 @@ use crate::fuse_abi::{
     fuse_write_out,
 };
 use crate::fuse_abi::{fuse_dirent, fuse_direntplus, fuse_out_header};
+use crate::{FileAttr, FileType};
+use async_trait::async_trait;
 use libc::{c_int, EIO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
 use log::warn;
 use std::convert::AsRef;
@@ -25,12 +27,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem, ptr, slice};
 
-use crate::{FileAttr, FileType};
-
 /// Generic reply callback to send data
-pub trait ReplySender: Send + 'static {
+#[async_trait]
+pub trait ReplySender: Send + Sync + 'static {
     /// Send data.
-    fn send(&self, data: &[&[u8]]);
+    async fn send(&self, data: &[&[u8]]);
 }
 
 impl fmt::Debug for Box<dyn ReplySender> {
@@ -45,15 +46,14 @@ pub trait Reply {
     fn new<S: ReplySender>(unique: u64, sender: S) -> Self;
 }
 
-/// Serialize an arbitrary type to bytes (memory copy, useful for fuse_*_out types)
-fn as_bytes<T, U, F: FnOnce(&[&[u8]]) -> U>(data: &T, f: F) -> U {
+fn cast_raw_bytes<T>(data: &T) -> &[u8] {
     let len = mem::size_of::<T>();
     match len {
-        0 => f(&[]),
+        0 => &[],
         len => {
             let p = data as *const T as *const u8;
             let bytes = unsafe { slice::from_raw_parts(p, len) };
-            f(&[bytes])
+            bytes
         }
     }
 }
@@ -176,7 +176,7 @@ impl<T> Reply for ReplyRaw<T> {
 impl<T> ReplyRaw<T> {
     /// Reply to a request with the given error code and data. Must be called
     /// only once (the `ok` and `error` methods ensure this by consuming `self`)
-    fn send(&mut self, err: c_int, bytes: &[&[u8]]) {
+    async fn send(&mut self, err: c_int, bytes: &[&[u8]]) {
         assert!(self.sender.is_some());
         let len = bytes.iter().fold(0, |l, b| l + b.len());
         let header = fuse_out_header {
@@ -184,24 +184,23 @@ impl<T> ReplyRaw<T> {
             error: -err,
             unique: self.unique,
         };
-        as_bytes(&header, |headerbytes| {
-            let sender = self.sender.take().unwrap();
-            let mut sendbytes = headerbytes.to_vec();
-            sendbytes.extend(bytes);
-            sender.send(&sendbytes);
-        });
+        let headerbytes = &[cast_raw_bytes(&header)];
+
+        let sender = self.sender.take().unwrap();
+        let mut sendbytes = headerbytes.to_vec();
+        sendbytes.extend(bytes);
+        sender.send(&sendbytes).await;
     }
 
     /// Reply to a request with the given type
-    pub fn ok(mut self, data: &T) {
-        as_bytes(data, |bytes| {
-            self.send(0, bytes);
-        })
+    pub async fn ok(mut self, data: &T) {
+        let bytes = &[cast_raw_bytes(data)];
+        self.send(0, bytes).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(mut self, err: c_int) {
-        self.send(err, &[]);
+    pub async fn error(mut self, err: c_int) {
+        self.send(err, &[]).await;
     }
 }
 
@@ -212,7 +211,7 @@ impl<T> Drop for ReplyRaw<T> {
                 "Reply not sent for operation {}, replying with I/O error",
                 self.unique
             );
-            self.send(EIO, &[]);
+            tokio::task::block_in_place(move || futures::executor::block_on(self.send(EIO, &[])));
         }
     }
 }
@@ -235,13 +234,13 @@ impl Reply for ReplyEmpty {
 
 impl ReplyEmpty {
     /// Reply to a request with nothing
-    pub fn ok(mut self) {
-        self.reply.send(0, &[]);
+    pub async fn ok(mut self) {
+        self.reply.send(0, &[]).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -263,13 +262,13 @@ impl Reply for ReplyData {
 
 impl ReplyData {
     /// Reply to a request with the given data
-    pub fn data(mut self, data: &[u8]) {
-        self.reply.send(0, &[data]);
+    pub async fn data(mut self, data: &[u8]) {
+        self.reply.send(0, &[data]).await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -291,21 +290,23 @@ impl Reply for ReplyEntry {
 
 impl ReplyEntry {
     /// Reply to a request with the given entry
-    pub fn entry(self, ttl: &Duration, attr: &FileAttr, generation: u64) {
-        self.reply.ok(&fuse_entry_out {
-            nodeid: attr.ino,
-            generation,
-            entry_valid: ttl.as_secs(),
-            attr_valid: ttl.as_secs(),
-            entry_valid_nsec: ttl.subsec_nanos(),
-            attr_valid_nsec: ttl.subsec_nanos(),
-            attr: fuse_attr_from_attr(attr),
-        });
+    pub async fn entry(self, ttl: &Duration, attr: &FileAttr, generation: u64) {
+        self.reply
+            .ok(&fuse_entry_out {
+                nodeid: attr.ino,
+                generation,
+                entry_valid: ttl.as_secs(),
+                attr_valid: ttl.as_secs(),
+                entry_valid_nsec: ttl.subsec_nanos(),
+                attr_valid_nsec: ttl.subsec_nanos(),
+                attr: fuse_attr_from_attr(attr),
+            })
+            .await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -327,18 +328,20 @@ impl Reply for ReplyAttr {
 
 impl ReplyAttr {
     /// Reply to a request with the given attribute
-    pub fn attr(self, ttl: &Duration, attr: &FileAttr) {
-        self.reply.ok(&fuse_attr_out {
-            attr_valid: ttl.as_secs(),
-            attr_valid_nsec: ttl.subsec_nanos(),
-            dummy: 0,
-            attr: fuse_attr_from_attr(attr),
-        });
+    pub async fn attr(self, ttl: &Duration, attr: &FileAttr) {
+        self.reply
+            .ok(&fuse_attr_out {
+                attr_valid: ttl.as_secs(),
+                attr_valid_nsec: ttl.subsec_nanos(),
+                dummy: 0,
+                attr: fuse_attr_from_attr(attr),
+            })
+            .await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -398,17 +401,19 @@ impl Reply for ReplyOpen {
 
 impl ReplyOpen {
     /// Reply to a request with the given open result
-    pub fn opened(self, fh: u64, flags: u32) {
-        self.reply.ok(&fuse_open_out {
-            fh,
-            open_flags: flags,
-            padding: 0,
-        });
+    pub async fn opened(self, fh: u64, flags: u32) {
+        self.reply
+            .ok(&fuse_open_out {
+                fh,
+                open_flags: flags,
+                padding: 0,
+            })
+            .await
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await
     }
 }
 
@@ -430,13 +435,13 @@ impl Reply for ReplyWrite {
 
 impl ReplyWrite {
     /// Reply to a request with the given open result
-    pub fn written(self, size: u32) {
-        self.reply.ok(&fuse_write_out { size, padding: 0 });
+    pub async fn written(self, size: u32) {
+        self.reply.ok(&fuse_write_out { size, padding: 0 }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -459,7 +464,7 @@ impl Reply for ReplyStatfs {
 impl ReplyStatfs {
     /// Reply to a request with the given open result
     #[allow(clippy::too_many_arguments)]
-    pub fn statfs(
+    pub async fn statfs(
         self,
         blocks: u64,
         bfree: u64,
@@ -470,25 +475,27 @@ impl ReplyStatfs {
         namelen: u32,
         frsize: u32,
     ) {
-        self.reply.ok(&fuse_statfs_out {
-            st: fuse_kstatfs {
-                blocks,
-                bfree,
-                bavail,
-                files,
-                ffree,
-                bsize,
-                namelen,
-                frsize,
-                padding: 0,
-                spare: [0; 6],
-            },
-        });
+        self.reply
+            .ok(&fuse_statfs_out {
+                st: fuse_kstatfs {
+                    blocks,
+                    bfree,
+                    bavail,
+                    files,
+                    ffree,
+                    bsize,
+                    namelen,
+                    frsize,
+                    padding: 0,
+                    spare: [0; 6],
+                },
+            })
+            .await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -510,28 +517,37 @@ impl Reply for ReplyCreate {
 
 impl ReplyCreate {
     /// Reply to a request with the given entry
-    pub fn created(self, ttl: &Duration, attr: &FileAttr, generation: u64, fh: u64, flags: u32) {
-        self.reply.ok(&(
-            fuse_entry_out {
-                nodeid: attr.ino,
-                generation,
-                entry_valid: ttl.as_secs(),
-                attr_valid: ttl.as_secs(),
-                entry_valid_nsec: ttl.subsec_nanos(),
-                attr_valid_nsec: ttl.subsec_nanos(),
-                attr: fuse_attr_from_attr(attr),
-            },
-            fuse_open_out {
-                fh,
-                open_flags: flags,
-                padding: 0,
-            },
-        ));
+    pub async fn created(
+        self,
+        ttl: &Duration,
+        attr: &FileAttr,
+        generation: u64,
+        fh: u64,
+        flags: u32,
+    ) {
+        self.reply
+            .ok(&(
+                fuse_entry_out {
+                    nodeid: attr.ino,
+                    generation,
+                    entry_valid: ttl.as_secs(),
+                    attr_valid: ttl.as_secs(),
+                    entry_valid_nsec: ttl.subsec_nanos(),
+                    attr_valid_nsec: ttl.subsec_nanos(),
+                    attr: fuse_attr_from_attr(attr),
+                },
+                fuse_open_out {
+                    fh,
+                    open_flags: flags,
+                    padding: 0,
+                },
+            ))
+            .await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -553,20 +569,22 @@ impl Reply for ReplyLock {
 
 impl ReplyLock {
     /// Reply to a request with the given open result
-    pub fn locked(self, start: u64, end: u64, typ: i32, pid: u32) {
-        self.reply.ok(&fuse_lk_out {
-            lk: fuse_file_lock {
-                start,
-                end,
-                typ,
-                pid,
-            },
-        });
+    pub async fn locked(self, start: u64, end: u64, typ: i32, pid: u32) {
+        self.reply
+            .ok(&fuse_lk_out {
+                lk: fuse_file_lock {
+                    start,
+                    end,
+                    typ,
+                    pid,
+                },
+            })
+            .await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -588,13 +606,13 @@ impl Reply for ReplyBmap {
 
 impl ReplyBmap {
     /// Reply to a request with the given open result
-    pub fn bmap(self, block: u64) {
-        self.reply.ok(&fuse_bmap_out { block });
+    pub async fn bmap(self, block: u64) {
+        self.reply.ok(&fuse_bmap_out { block }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -616,7 +634,7 @@ impl Reply for ReplyIoctl {
 
 impl ReplyIoctl {
     /// Reply to a request with the given open result
-    pub fn ioctl(mut self, result: i32, data: &[u8]) {
+    pub async fn ioctl(mut self, result: i32, data: &[u8]) {
         let header = fuse_ioctl_out {
             result,
             // these fields are only needed for unrestricted ioctls
@@ -630,15 +648,15 @@ impl ReplyIoctl {
         let header_bytes = unsafe { slice::from_raw_parts(header_p, header_len) };
 
         if !data.is_empty() {
-            self.reply.send(0, &[header_bytes, data]);
+            self.reply.send(0, &[header_bytes, data]).await;
         } else {
-            self.reply.send(0, &[header_bytes]);
+            self.reply.send(0, &[header_bytes]).await;
         }
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -690,13 +708,13 @@ impl ReplyDirectory {
     }
 
     /// Reply to a request with the filled directory buffer
-    pub fn ok(mut self) {
-        self.reply.send(0, &[&self.data]);
+    pub async fn ok(mut self) {
+        self.reply.send(0, &[&self.data]).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -768,13 +786,13 @@ impl ReplyDirectoryPlus {
     }
 
     /// Reply to a request with the filled directory buffer
-    pub fn ok(mut self) {
-        self.reply.send(0, &[&self.data]);
+    pub async fn ok(mut self) {
+        self.reply.send(0, &[&self.data]).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -796,18 +814,18 @@ impl Reply for ReplyXattr {
 
 impl ReplyXattr {
     /// Reply to a request with the size of the xattr.
-    pub fn size(self, size: u32) {
-        self.reply.ok(&fuse_getxattr_out { size, padding: 0 });
+    pub async fn size(self, size: u32) {
+        self.reply.ok(&fuse_getxattr_out { size, padding: 0 }).await;
     }
 
     /// Reply to a request with the data in the xattr.
-    pub fn data(mut self, data: &[u8]) {
-        self.reply.send(0, &[data]);
+    pub async fn data(mut self, data: &[u8]) {
+        self.reply.send(0, &[data]).await;
     }
 
     /// Reply to a request with the given error code.
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
@@ -829,27 +847,27 @@ impl Reply for ReplyLseek {
 
 impl ReplyLseek {
     /// Reply to a request with seeked offset
-    pub fn offset(self, offset: i64) {
-        self.reply.ok(&fuse_lseek_out { offset });
+    pub async fn offset(self, offset: i64) {
+        self.reply.ok(&fuse_lseek_out { offset }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 
 #[cfg(test)]
 mod test {
-    use super::as_bytes;
+    use futures::channel::mpsc::{channel, Sender};
+
+    use super::cast_raw_bytes;
     #[cfg(target_os = "macos")]
     use super::ReplyXTimes;
     use super::ReplyXattr;
     use super::{Reply, ReplyAttr, ReplyData, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyRaw};
     use super::{ReplyBmap, ReplyCreate, ReplyDirectory, ReplyLock, ReplyStatfs, ReplyWrite};
     use crate::{FileAttr, FileType};
-    use std::sync::mpsc::{channel, Sender};
-    use std::thread;
     use std::time::{Duration, UNIX_EPOCH};
 
     #[allow(dead_code)]
@@ -863,17 +881,16 @@ mod test {
     #[test]
     fn serialize_empty() {
         let data = ();
-        as_bytes(&data, |bytes| {
-            assert!(bytes.is_empty());
-        });
+        let bytes = cast_raw_bytes(&data);
+        assert!(bytes.is_empty());
     }
 
     #[test]
     fn serialize_slice() {
         let data: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
-        as_bytes(&data, |bytes| {
-            assert_eq!(bytes, [[0x12, 0x34, 0x56, 0x78]]);
-        });
+        let bytes = [cast_raw_bytes(&data)];
+
+        assert_eq!(bytes, [[0x12, 0x34, 0x56, 0x78]]);
     }
 
     #[test]
@@ -883,9 +900,9 @@ mod test {
             b: 0x34,
             c: 0x5678,
         };
-        as_bytes(&data, |bytes| {
-            assert_eq!(bytes, [[0x12, 0x34, 0x78, 0x56]]);
-        });
+        let bytes = [cast_raw_bytes(&data)];
+
+        assert_eq!(bytes, [[0x12, 0x34, 0x78, 0x56]]);
     }
 
     #[test]
@@ -902,23 +919,24 @@ mod test {
                 c: 0xdef0,
             },
         );
-        as_bytes(&data, |bytes| {
-            assert_eq!(bytes, [[0x12, 0x34, 0x78, 0x56, 0x9a, 0xbc, 0xf0, 0xde]]);
-        });
+        let bytes = [cast_raw_bytes(&data)];
+
+        assert_eq!(bytes, [[0x12, 0x34, 0x78, 0x56, 0x9a, 0xbc, 0xf0, 0xde]]);
     }
 
     struct AssertSender {
         expected: Vec<Vec<u8>>,
     }
 
+    #[async_trait::async_trait]
     impl super::ReplySender for AssertSender {
-        fn send(&self, data: &[&[u8]]) {
+        async fn send(&self, data: &[&[u8]]) {
             assert_eq!(self.expected, data);
         }
     }
 
-    #[test]
-    fn reply_raw() {
+    #[tokio::test]
+    async fn reply_raw() {
         let data = Data {
             a: 0x12,
             b: 0x34,
@@ -934,11 +952,11 @@ mod test {
             ],
         };
         let reply: ReplyRaw<Data> = Reply::new(0xdeadbeef, sender);
-        reply.ok(&data);
+        reply.ok(&data).await;
     }
 
-    #[test]
-    fn reply_error() {
+    #[tokio::test]
+    async fn reply_error() {
         let sender = AssertSender {
             expected: vec![vec![
                 0x10, 0x00, 0x00, 0x00, 0xbe, 0xff, 0xff, 0xff, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00,
@@ -946,11 +964,11 @@ mod test {
             ]],
         };
         let reply: ReplyRaw<Data> = Reply::new(0xdeadbeef, sender);
-        reply.error(66);
+        reply.error(66).await;
     }
 
-    #[test]
-    fn reply_empty() {
+    #[tokio::test]
+    async fn reply_empty() {
         let sender = AssertSender {
             expected: vec![vec![
                 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00,
@@ -958,11 +976,11 @@ mod test {
             ]],
         };
         let reply: ReplyEmpty = Reply::new(0xdeadbeef, sender);
-        reply.ok();
+        reply.ok().await;
     }
 
-    #[test]
-    fn reply_data() {
+    #[tokio::test]
+    async fn reply_data() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -973,11 +991,11 @@ mod test {
             ],
         };
         let reply: ReplyData = Reply::new(0xdeadbeef, sender);
-        reply.data(&[0xde, 0xad, 0xbe, 0xef]);
+        reply.data(&[0xde, 0xad, 0xbe, 0xef]).await;
     }
 
-    #[test]
-    fn reply_entry() {
+    #[tokio::test]
+    async fn reply_entry() {
         let mut expected = if cfg!(target_os = "macos") {
             vec![
                 vec![
@@ -1046,11 +1064,11 @@ mod test {
             blksize: 0xbb,
             padding: 0xcc,
         };
-        reply.entry(&ttl, &attr, 0xaa);
+        reply.entry(&ttl, &attr, 0xaa).await;
     }
 
-    #[test]
-    fn reply_attr() {
+    #[tokio::test]
+    async fn reply_attr() {
         let mut expected = if cfg!(target_os = "macos") {
             vec![
                 vec![
@@ -1115,12 +1133,12 @@ mod test {
             blksize: 0xbb,
             padding: 0xcc,
         };
-        reply.attr(&ttl, &attr);
+        reply.attr(&ttl, &attr).await;
     }
 
-    #[test]
+    #[tokio::test]
     #[cfg(target_os = "macos")]
-    fn reply_xtimes() {
+    async fn reply_xtimes() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1135,11 +1153,11 @@ mod test {
         };
         let reply: ReplyXTimes = Reply::new(0xdeadbeef, sender);
         let time = UNIX_EPOCH + Duration::new(0x1234, 0x5678);
-        reply.xtimes(time, time);
+        reply.xtimes(time, time).await;
     }
 
-    #[test]
-    fn reply_open() {
+    #[tokio::test]
+    async fn reply_open() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1153,11 +1171,11 @@ mod test {
             ],
         };
         let reply: ReplyOpen = Reply::new(0xdeadbeef, sender);
-        reply.opened(0x1122, 0x33);
+        reply.opened(0x1122, 0x33).await;
     }
 
-    #[test]
-    fn reply_write() {
+    #[tokio::test]
+    async fn reply_write() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1168,11 +1186,11 @@ mod test {
             ],
         };
         let reply: ReplyWrite = Reply::new(0xdeadbeef, sender);
-        reply.written(0x1122);
+        reply.written(0x1122).await;
     }
 
-    #[test]
-    fn reply_statfs() {
+    #[tokio::test]
+    async fn reply_statfs() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1191,11 +1209,13 @@ mod test {
             ],
         };
         let reply: ReplyStatfs = Reply::new(0xdeadbeef, sender);
-        reply.statfs(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88);
+        reply
+            .statfs(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
+            .await;
     }
 
-    #[test]
-    fn reply_create() {
+    #[tokio::test]
+    async fn reply_create() {
         let mut expected = if cfg!(target_os = "macos") {
             vec![
                 vec![
@@ -1270,11 +1290,11 @@ mod test {
             blksize: 0xdd,
             padding: 0xee,
         };
-        reply.created(&ttl, &attr, 0xaa, 0xbb, 0xcc);
+        reply.created(&ttl, &attr, 0xaa, 0xbb, 0xcc).await;
     }
 
-    #[test]
-    fn reply_lock() {
+    #[tokio::test]
+    async fn reply_lock() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1288,11 +1308,11 @@ mod test {
             ],
         };
         let reply: ReplyLock = Reply::new(0xdeadbeef, sender);
-        reply.locked(0x11, 0x22, 0x33, 0x44);
+        reply.locked(0x11, 0x22, 0x33, 0x44).await;
     }
 
-    #[test]
-    fn reply_bmap() {
+    #[tokio::test]
+    async fn reply_bmap() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1303,11 +1323,11 @@ mod test {
             ],
         };
         let reply: ReplyBmap = Reply::new(0xdeadbeef, sender);
-        reply.bmap(0x1234);
+        reply.bmap(0x1234).await;
     }
 
-    #[test]
-    fn reply_directory() {
+    #[tokio::test]
+    async fn reply_directory() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1326,17 +1346,11 @@ mod test {
         let mut reply = ReplyDirectory::new(0xdeadbeef, sender, 4096);
         assert!(!reply.add(0xaabb, 1, FileType::Directory, "hello"));
         assert!(!reply.add(0xccdd, 2, FileType::RegularFile, "world.rs"));
-        reply.ok();
+        reply.ok().await;
     }
 
-    impl super::ReplySender for Sender<()> {
-        fn send(&self, _: &[&[u8]]) {
-            Sender::send(self, ()).unwrap()
-        }
-    }
-
-    #[test]
-    fn reply_xattr_size() {
+    #[tokio::test]
+    async fn reply_xattr_size() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1347,11 +1361,11 @@ mod test {
             ],
         };
         let reply = ReplyXattr::new(0xdeadbeef, sender);
-        reply.size(0x12345678);
+        reply.size(0x12345678).await;
     }
 
-    #[test]
-    fn reply_xattr_data() {
+    #[tokio::test]
+    async fn reply_xattr_data() {
         let sender = AssertSender {
             expected: vec![
                 vec![
@@ -1362,16 +1376,32 @@ mod test {
             ],
         };
         let reply = ReplyXattr::new(0xdeadbeef, sender);
-        reply.data(&[0x11, 0x22, 0x33, 0x44]);
+        reply.data(&[0x11, 0x22, 0x33, 0x44]).await;
     }
 
-    #[test]
-    fn async_reply() {
-        let (tx, rx) = channel::<()>();
-        let reply: ReplyEmpty = Reply::new(0xdeadbeef, tx);
-        thread::spawn(move || {
-            reply.ok();
+    struct SenderWrapper(std::sync::Arc<tokio::sync::Mutex<Sender<()>>>);
+    #[async_trait::async_trait]
+    impl super::ReplySender for SenderWrapper {
+        async fn send(&self, _: &[&[u8]]) {
+            use futures::sink::SinkExt;
+
+            let mut inner = self.0.lock().await;
+            let r: &mut Sender<()> = &mut inner;
+            SinkExt::send(r, ()).await.unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn async_reply() {
+        use futures::stream::StreamExt;
+        let (tx, mut rx) = channel::<()>(50);
+        let reply: ReplyEmpty = Reply::new(
+            0xdeadbeef,
+            SenderWrapper(std::sync::Arc::new(tokio::sync::Mutex::new(tx))),
+        );
+        tokio::task::spawn(async move {
+            reply.ok().await;
         });
-        rx.recv().unwrap();
+        rx.next().await.unwrap();
     }
 }
