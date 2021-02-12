@@ -106,7 +106,7 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     async fn read_single_request<'a, 'b>(
-        ch: Arc<AsyncFd<FileDescriptorRawHandle>>,
+        ch: &Arc<AsyncFd<FileDescriptorRawHandle>>,
         mut buffer: Vec<u8>,
     ) -> Option<io::Result<Request<'b>>> {
         match Channel::receive(ch, &mut buffer).await {
@@ -131,38 +131,50 @@ impl<FS: Filesystem> Session<FS> {
         None
     }
 
-    async fn handle_request(
-        active_session: Arc<ActiveSession>,
-        ch: Arc<AsyncFd<FileDescriptorRawHandle>>,
-        filesystem: Arc<FS>,
+    async fn main_request_loop(
+        active_session: &Arc<ActiveSession>,
+        ch: &Arc<AsyncFd<FileDescriptorRawHandle>>,
+        filesystem: &Arc<FS>,
         _worker_idx: usize,
     ) -> io::Result<()> {
-        let buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+        let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
 
         let sender = ChannelSender { fd: ch.clone() };
 
-        if let Some(req_or_err) = Session::<FS>::read_single_request(ch.clone(), buffer).await {
-            let req = req_or_err?;
-
-            if !req
-                .maybe_destroy_dispatch(&active_session, sender.clone())
-                .await
+        loop {
+            if active_session
+                .destroyed
+                .load(std::sync::atomic::Ordering::Relaxed)
             {
-                let filesystem = filesystem.clone();
-                let sender = sender.clone();
+                return Ok(());
+            }
 
-                tokio::task::spawn(async move {
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, buffer).await {
+                let req = req_or_err?;
+
+                if !req
+                    .maybe_destroy_dispatch(&active_session, sender.clone())
+                    .await
+                {
+                    let filesystem = filesystem.clone();
+                    let sender = sender.clone();
+
+                    // tokio::task::spawn(async move {
                     match req.dispatch(filesystem, sender).await {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("I/O failure in dispatch paths: {:#?}", e);
                         }
                     };
-                });
+                    buffer = req.data;
+                // });
+                } else {
+                    buffer = Vec::with_capacity(BUFFER_SIZE);
+                }
+            } else {
+                buffer = Vec::with_capacity(BUFFER_SIZE);
             }
         }
-
-        Ok(())
     }
 
     pub(crate) async fn spawn_worker_loop(
@@ -182,7 +194,7 @@ impl<FS: Filesystem> Session<FS> {
                 return Ok(());
             }
 
-            if let Some(req_or_err) = Session::<FS>::read_single_request(ch.clone(), buffer).await {
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, buffer).await {
                 let req = req_or_err?;
                 if !active_session
                     .initialized
@@ -216,21 +228,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
 
-        loop {
-            if active_session
-                .destroyed
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
-                return Ok(());
-            }
-            Session::handle_request(
-                active_session.clone(),
-                ch.clone(),
-                filesystem.clone(),
-                worker_idx,
-            )
-            .await?;
-        }
+        Session::main_request_loop(&active_session, &ch, &filesystem, worker_idx).await
     }
 
     async fn driver_evt_loop(

@@ -18,9 +18,9 @@ use libc::{self, c_int, c_void, size_t, O_NONBLOCK};
 use log::error;
 #[cfg(any(feature = "libfuse", test))]
 use std::ffi::OsStr;
-use std::os::unix::{ffi::OsStrExt, prelude::AsRawFd};
 use std::os::unix::io::IntoRawFd;
 use std::os::unix::io::RawFd;
+use std::os::unix::{ffi::OsStrExt, prelude::AsRawFd};
 use std::path::{Path, PathBuf};
 use std::{
     ffi::{CStr, CString},
@@ -29,7 +29,7 @@ use std::{
 use std::{io, ptr};
 use tokio::io::unix::AsyncFd;
 
-use crate::{reply::ReplySender};
+use crate::reply::ReplySender;
 #[cfg(not(feature = "libfuse"))]
 use crate::MountOption;
 
@@ -62,7 +62,7 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[&OsStr], f: F) -> T 
 /// In the latest version of rust this isn't required since RawFd implements AsRawFD
 /// but until pretty recently that didn't work. So including this wrapper is cheap and allows
 /// us better compatibility.
-#[derive(Debug,Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct FileDescriptorRawHandle(pub(in crate) RawFd);
 impl AsRawFd for FileDescriptorRawHandle {
     fn as_raw_fd(&self) -> RawFd {
@@ -101,7 +101,10 @@ impl Channel {
     /// Create worker fd's takes the root/session file descriptor and makes several clones
     /// This allows file systems to work concurrently over several buffers/descriptors for concurrent operation
     ///
-    fn create_worker_fds(root_fd: &FileDescriptorRawHandle, worker_channels: usize) -> io::Result<Vec<FileDescriptorRawHandle>> {
+    fn create_worker_fds(
+        root_fd: &FileDescriptorRawHandle,
+        worker_channels: usize,
+    ) -> io::Result<Vec<FileDescriptorRawHandle>> {
         let fuse_device_name = "/dev/fuse";
 
         let mut res = Vec::default();
@@ -253,7 +256,10 @@ impl Channel {
         &self.mountpoint
     }
 
-    pub(in crate) fn blocking_receive(fd: &FileDescriptorRawHandle, buffer: &mut Vec<u8>) -> io::Result<()> {
+    pub(in crate) fn blocking_receive(
+        fd: &FileDescriptorRawHandle,
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<()> {
         loop {
             let rc = unsafe {
                 libc::read(
@@ -273,7 +279,10 @@ impl Channel {
         }
     }
     /// Receives data up to the capacity of the given buffer (can block).
-    pub(in crate) async fn receive(async_fd: Arc<AsyncFd<FileDescriptorRawHandle>>, buffer: &mut Vec<u8>) -> io::Result<()> {
+    pub(in crate) async fn receive(
+        async_fd: &Arc<AsyncFd<FileDescriptorRawHandle>>,
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<()> {
         loop {
             let mut guard = async_fd.readable().await?;
 

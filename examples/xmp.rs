@@ -438,15 +438,9 @@ impl Filesystem for XmpFS {
 
         let size = size as usize;
 
-        //     let mut b: Vec<u8> = Vec::with_capacity(size as usize);
-        // b.resize(size as usize, 0);
-        // reply.data(&b[..]).await
-
-        // let b = tokio::task::spawn_blocking(move || read_blocking(f, size, offset))
-        //     .await
-        //     .unwrap();
-
-        let b = read_blocking(f, size, offset);
+        let b = tokio::task::spawn_blocking(move || read_blocking(f, size, offset))
+            .await
+            .unwrap();
 
         match b {
             Ok(b) => {
@@ -461,10 +455,6 @@ impl Filesystem for XmpFS {
                 }
             },
         }
-
-        // let mut b: Vec<u8> = Vec::with_capacity(size as usize);
-        //     b.resize(size as usize, 0);
-        //     reply.data(&b[..]).await
     }
 
     async fn write(
@@ -479,7 +469,7 @@ impl Filesystem for XmpFS {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let file_opt = self.opened_files.get(&fh); //;.map(|e| e.try_clone().unwrap());
+        let file_opt = self.opened_files.get(&fh);
         let f = match file_opt {
             None => {
                 return reply.error(EIO).await;
@@ -500,7 +490,15 @@ impl Filesystem for XmpFS {
         };
     }
 
-    async fn fsync(&self, _req: &Request<'_>, _ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
+    async fn fsync(
+        &self,
+        _req: &Request<'_>,
+        _ino: u64,
+        fh: u64,
+        datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        eprintln!("Calling fsync");
         if !self.opened_files.contains_key(&fh) {
             reply.error(EIO).await;
             return;
@@ -513,7 +511,10 @@ impl Filesystem for XmpFS {
         } else {
             f.sync_all()
         } {
-            Err(e) => {reply.error(errhandle_no_cleanup(e).await).await; return;},
+            Err(e) => {
+                reply.error(errhandle_no_cleanup(e).await).await;
+                return;
+            }
             Ok(()) => {
                 reply.ok().await;
             }
