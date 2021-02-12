@@ -366,7 +366,7 @@ impl Reply for ReplyXTimes {
 #[cfg(target_os = "macos")]
 impl ReplyXTimes {
     /// Reply to a request with the given xtimes
-    pub fn xtimes(self, bkuptime: SystemTime, crtime: SystemTime) {
+    pub async fn xtimes(self, bkuptime: SystemTime, crtime: SystemTime) {
         let (bkuptime_secs, bkuptime_nanos) = time_from_system_time(&bkuptime);
         let (crtime_secs, crtime_nanos) = time_from_system_time(&crtime);
         self.reply.ok(&fuse_getxtimes_out {
@@ -374,12 +374,12 @@ impl ReplyXTimes {
             crtime: crtime_secs as u64,
             bkuptimensec: bkuptime_nanos,
             crtimensec: crtime_nanos,
-        });
+        }).await;
     }
 
     /// Reply to a request with the given error code
-    pub fn error(self, err: c_int) {
-        self.reply.error(err);
+    pub async fn error(self, err: c_int) {
+        self.reply.error(err).await;
     }
 }
 

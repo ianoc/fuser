@@ -833,7 +833,7 @@ pub trait Filesystem: Send + Sync + 'static {
 
     /// macOS only (undocumented)
     #[cfg(target_os = "macos")]
-    fn exchange(
+    async fn exchange(
         &self,
         _req: &Request<'_>,
         _parent: u64,
@@ -843,14 +843,14 @@ pub trait Filesystem: Send + Sync + 'static {
         _options: u64,
         reply: ReplyEmpty,
     ) {
-        reply.error(ENOSYS);
+        reply.error(ENOSYS).await;
     }
 
     /// macOS only: Query extended times (bkuptime and crtime). Set fuse_init_out.flags
     /// during init to FUSE_XTIMES to enable
     #[cfg(target_os = "macos")]
-    fn getxtimes(&self, _req: &Request<'_>, _ino: u64, reply: ReplyXTimes) {
-        reply.error(ENOSYS);
+    async fn getxtimes(&self, _req: &Request<'_>, _ino: u64, reply: ReplyXTimes) {
+        reply.error(ENOSYS).await;
     }
 }
 

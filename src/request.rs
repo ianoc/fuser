@@ -807,11 +807,11 @@ impl<'a> Request<'a> {
             }
             #[cfg(target_os = "macos")]
             ll::Operation::SetVolName { name } => {
-                filesystem.setvolname(self, name, self.reply(&ch));
+                filesystem.setvolname(self, name, self.reply(&ch)).await;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes => {
-                filesystem.getxtimes(self, self.request.nodeid(), self.reply(&ch));
+                filesystem.getxtimes(self, self.request.nodeid(), self.reply(&ch)).await;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange {
@@ -827,7 +827,7 @@ impl<'a> Request<'a> {
                     &newname,
                     arg.options,
                     self.reply(&ch),
-                );
+                ).await;
             }
 
             #[cfg(feature = "abi-7-12")]
