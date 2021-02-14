@@ -147,20 +147,15 @@ impl<FS: Filesystem> Session<FS> {
             if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
                 let req = req_or_err?;
 
-                if !req
-                    .maybe_destroy_dispatch(&active_session, sender.clone())
-                    .await
-                {
-                    let filesystem = filesystem.clone();
-                    let sender = sender.clone();
+                let filesystem = filesystem.clone();
+                let sender = sender.clone();
 
-                    match req.dispatch(filesystem, sender).await {
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("I/O failure in dispatch paths: {:#?}", e);
-                        }
-                    };
-                }
+                match req.dispatch(&active_session, filesystem, sender).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("I/O failure in dispatch paths: {:#?}", e);
+                    }
+                };
             }
         }
     }
@@ -190,14 +185,11 @@ impl<FS: Filesystem> Session<FS> {
                 {
                     req.dispatch_init(&active_session, &filesystem, sender.clone())
                         .await;
-                } else if !req
-                    .maybe_destroy_dispatch(&active_session, sender.clone())
-                    .await
-                {
+                } else {
                     let filesystem = filesystem.clone();
                     let sender = sender.clone();
 
-                    match req.dispatch(filesystem, sender).await {
+                    match req.dispatch(&active_session, filesystem, sender).await {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("I/O failure in dispatch paths: {:#?}", e);

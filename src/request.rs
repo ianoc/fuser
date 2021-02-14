@@ -129,30 +129,12 @@ impl<'a> Request<'a> {
         }
     }
 
-    pub(crate) async fn maybe_destroy_dispatch(
-        &self,
-        active_session: &Arc<ActiveSession>,
-        ch: ChannelSender,
-    ) -> bool {
-        debug!("{}", self.request);
-        match self.request.operation() {
-            // Filesystem destroyed
-            ll::Operation::Destroy => {
-                active_session
-                    .destroyed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-
-                self.reply::<ReplyEmpty>(&ch).ok().await;
-                true
-            }
-            _ => false,
-        }
-    }
     /// Dispatch request to the given filesystem.
     /// This calls the appropriate filesystem operation method for the
     /// request and sends back the returned reply to the kernel
     pub(crate) async fn dispatch<FS: Filesystem>(
         &self,
+        active_session: &Arc<ActiveSession>,
         filesystem: Arc<FS>,
         ch: ChannelSender,
     ) -> std::io::Result<()> {
@@ -839,7 +821,11 @@ impl<'a> Request<'a> {
             }
 
             ll::Operation::Destroy => {
-                unreachable!()
+                active_session
+                    .destroyed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+
+                self.reply::<ReplyEmpty>(&ch).ok().await;
             }
         }
         Ok(())

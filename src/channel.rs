@@ -258,10 +258,7 @@ impl Channel {
         &self.mountpoint
     }
 
-    pub(in crate) fn blocking_receive(
-        fd: &FileDescriptorRawHandle,
-        buffer: &mut Vec<u8>,
-    ) -> io::Result<()> {
+    fn blocking_receive(fd: &FileDescriptorRawHandle, buffer: &mut Vec<u8>) -> io::Result<()> {
         let rc = unsafe {
             libc::read(
                 fd.0,
