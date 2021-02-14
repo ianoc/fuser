@@ -1,4 +1,4 @@
-#![allow(clippy::needless_return)]
+#![allow(clippy::needless_return, clippy::too_many_arguments)]
 
 use clap::{crate_version, App, Arg};
 use fuser::consts::FOPEN_DIRECT_IO;

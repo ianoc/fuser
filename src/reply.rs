@@ -369,12 +369,14 @@ impl ReplyXTimes {
     pub async fn xtimes(self, bkuptime: SystemTime, crtime: SystemTime) {
         let (bkuptime_secs, bkuptime_nanos) = time_from_system_time(&bkuptime);
         let (crtime_secs, crtime_nanos) = time_from_system_time(&crtime);
-        self.reply.ok(&fuse_getxtimes_out {
-            bkuptime: bkuptime_secs as u64,
-            crtime: crtime_secs as u64,
-            bkuptimensec: bkuptime_nanos,
-            crtimensec: crtime_nanos,
-        }).await;
+        self.reply
+            .ok(&fuse_getxtimes_out {
+                bkuptime: bkuptime_secs as u64,
+                crtime: crtime_secs as u64,
+                bkuptimensec: bkuptime_nanos,
+                crtimensec: crtime_nanos,
+            })
+            .await;
     }
 
     /// Reply to a request with the given error code

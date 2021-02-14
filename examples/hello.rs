@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,

@@ -99,7 +99,9 @@ impl Channel {
 
     ///
     /// Create worker fd's takes the root/session file descriptor and makes several clones
-    /// This allows file systems to work concurrently over several buffers/descriptors for concurrent operation
+    /// This allows file systems to work concurrently over several buffers/descriptors for concurrent operation.
+    /// More detailed description of the protocol is at:
+    /// https://john-millikin.com/the-fuse-protocol#multi-threading
     ///
     fn create_worker_fds(
         root_fd: &FileDescriptorRawHandle,
@@ -177,7 +179,7 @@ impl Channel {
             let fd = unsafe { fuse_mount_compat25(mnt.as_ptr(), args) };
 
             Channel::set_non_block(fd)?;
-            
+
             if fd < 0 {
                 Err(io::Error::last_os_error())
             } else {
@@ -260,28 +262,26 @@ impl Channel {
         fd: &FileDescriptorRawHandle,
         buffer: &mut Vec<u8>,
     ) -> io::Result<()> {
-        loop {
-            let rc = unsafe {
-                libc::read(
-                    fd.0,
-                    buffer.as_ptr() as *mut c_void,
-                    buffer.capacity() as size_t,
-                )
-            };
-            if rc < 0 {
-                return Err(io::Error::last_os_error());
-            } else {
-                unsafe {
-                    buffer.set_len(rc as usize);
-                }
-                return Ok(());
+        let rc = unsafe {
+            libc::read(
+                fd.0,
+                buffer.as_ptr() as *mut c_void,
+                buffer.capacity() as size_t,
+            )
+        };
+        if rc < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            unsafe {
+                buffer.set_len(rc as usize);
             }
+            Ok(())
         }
     }
     /// Receives data up to the capacity of the given buffer (can block).
-    pub(in crate) async fn receive(
-        async_fd: &Arc<AsyncFd<FileDescriptorRawHandle>>,
-        buffer: &mut Vec<u8>,
+    pub(in crate) async fn receive<'a, 'b>(
+        async_fd: &'a Arc<AsyncFd<FileDescriptorRawHandle>>,
+        buffer: &'b mut Vec<u8>,
     ) -> io::Result<()> {
         loop {
             let mut guard = async_fd.readable().await?;

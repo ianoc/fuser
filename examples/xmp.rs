@@ -1,6 +1,7 @@
 //! Analogue of fusexmp
 //!
 //! See also a more high-level example: https://github.com/wfraser/fuse-mt/tree/master/example
+#![allow(clippy::too_many_arguments)]
 
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty,
@@ -55,8 +56,7 @@ struct XmpFS {
 }
 
 fn read_blocking(f: File, size: usize, offset: i64) -> std::io::Result<Vec<u8>> {
-    let mut b = Vec::with_capacity(size);
-    b.resize(size, 0);
+    let mut b = vec![0; size];
 
     use std::os::unix::fs::FileExt;
 
@@ -581,7 +581,7 @@ impl Filesystem for XmpFS {
                 };
 
                 v.push(DirInfo {
-                    ino: ino,
+                    ino,
                     kind: FileType::Directory,
                     name: OsStr::from_bytes(b".").to_os_string(),
                 });

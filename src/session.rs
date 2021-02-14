@@ -79,10 +79,7 @@ impl<FS: Filesystem> Session<FS> {
         options: &[&OsStr],
     ) -> io::Result<Session<FS>> {
         info!("Mounting {}", mountpoint.display());
-        Channel::new(mountpoint, worker_channel_count, options).map(|ch| Session {
-            filesystem: filesystem,
-            ch: ch,
-        })
+        Channel::new(mountpoint, worker_channel_count, options).map(|ch| Session { filesystem, ch })
     }
 
     /// Create a new session by mounting the given filesystem to the given mountpoint
@@ -94,10 +91,8 @@ impl<FS: Filesystem> Session<FS> {
         options: &[MountOption],
     ) -> io::Result<Session<FS>> {
         info!("Mounting {}", mountpoint.display());
-        Channel::new2(mountpoint, worker_channel_count, options).map(|ch| Session {
-            filesystem: filesystem,
-            ch: ch,
-        })
+        Channel::new2(mountpoint, worker_channel_count, options)
+            .map(|ch| Session { filesystem, ch })
     }
 
     /// Return path of the mounted filesystem
@@ -107,9 +102,9 @@ impl<FS: Filesystem> Session<FS> {
 
     async fn read_single_request<'a, 'b>(
         ch: &Arc<AsyncFd<FileDescriptorRawHandle>>,
-        mut buffer: Vec<u8>,
+        buffer: &'b mut Vec<u8>,
     ) -> Option<io::Result<Request<'b>>> {
-        match Channel::receive(ch, &mut buffer).await {
+        match Channel::receive(ch, buffer).await {
             Err(err) => match err.raw_os_error() {
                 // Operation interrupted. Accordingly to FUSE, this is safe to retry
                 Some(ENOENT) => return None,
@@ -149,7 +144,7 @@ impl<FS: Filesystem> Session<FS> {
                 return Ok(());
             }
 
-            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, buffer).await {
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
                 let req = req_or_err?;
 
                 if !req
@@ -159,20 +154,13 @@ impl<FS: Filesystem> Session<FS> {
                     let filesystem = filesystem.clone();
                     let sender = sender.clone();
 
-                    // tokio::task::spawn(async move {
                     match req.dispatch(filesystem, sender).await {
                         Ok(_) => {}
                         Err(e) => {
                             warn!("I/O failure in dispatch paths: {:#?}", e);
                         }
                     };
-                    buffer = req.data;
-                // });
-                } else {
-                    buffer = Vec::with_capacity(BUFFER_SIZE);
                 }
-            } else {
-                buffer = Vec::with_capacity(BUFFER_SIZE);
             }
         }
     }
@@ -185,7 +173,7 @@ impl<FS: Filesystem> Session<FS> {
     ) -> io::Result<()> {
         let sender = ChannelSender { fd: ch.clone() };
         loop {
-            let buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
+            let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
 
             if active_session
                 .destroyed
@@ -194,7 +182,7 @@ impl<FS: Filesystem> Session<FS> {
                 return Ok(());
             }
 
-            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, buffer).await {
+            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
                 let req = req_or_err?;
                 if !active_session
                     .initialized
@@ -202,21 +190,19 @@ impl<FS: Filesystem> Session<FS> {
                 {
                     req.dispatch_init(&active_session, &filesystem, sender.clone())
                         .await;
-                } else {
-                    if !req
-                        .maybe_destroy_dispatch(&active_session, sender.clone())
-                        .await
-                    {
-                        let filesystem = filesystem.clone();
-                        let sender = sender.clone();
+                } else if !req
+                    .maybe_destroy_dispatch(&active_session, sender.clone())
+                    .await
+                {
+                    let filesystem = filesystem.clone();
+                    let sender = sender.clone();
 
-                        match req.dispatch(filesystem, sender).await {
-                            Ok(_) => {}
-                            Err(e) => {
-                                warn!("I/O failure in dispatch paths: {:#?}", e);
-                            }
-                        };
-                    }
+                    match req.dispatch(filesystem, sender).await {
+                        Ok(_) => {}
+                        Err(e) => {
+                            warn!("I/O failure in dispatch paths: {:#?}", e);
+                        }
+                    };
                 }
 
                 if active_session

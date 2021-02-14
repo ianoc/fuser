@@ -33,17 +33,15 @@ fn system_time_from_time(secs: i64, nsecs: u32) -> SystemTime {
 #[derive(Debug)]
 pub struct Request<'a> {
     /// Request raw data
-    pub data: Vec<u8>,
+    pub data: &'a [u8],
     /// Parsed request
     pub request: ll::Request<'a>,
 }
 
 impl<'a> Request<'a> {
     /// Create a new request from the given data
-    pub fn new(data: Vec<u8>) -> Option<Request<'a>> {
-        let buffer_ptr: &[u8] = unsafe { &*(data.as_ref() as *const [u8]) };
-
-        let request = match ll::Request::try_from(buffer_ptr) {
+    pub fn new(data: &'a [u8]) -> Option<Request<'a>> {
+        let request = match ll::Request::try_from(data) {
             Ok(request) => request,
             Err(err) => {
                 // FIXME: Reply with ENOSYS?
@@ -60,7 +58,7 @@ impl<'a> Request<'a> {
         se: &Arc<ActiveSession>,
         filesystem: &Arc<FS>,
         ch: ChannelSender,
-    ) -> () {
+    ) {
         debug!("{}", self.request);
         match self.request.operation() {
             // Filesystem initialization
@@ -811,7 +809,9 @@ impl<'a> Request<'a> {
             }
             #[cfg(target_os = "macos")]
             ll::Operation::GetXTimes => {
-                filesystem.getxtimes(self, self.request.nodeid(), self.reply(&ch)).await;
+                filesystem
+                    .getxtimes(self, self.request.nodeid(), self.reply(&ch))
+                    .await;
             }
             #[cfg(target_os = "macos")]
             ll::Operation::Exchange {
@@ -819,15 +819,17 @@ impl<'a> Request<'a> {
                 oldname,
                 newname,
             } => {
-                filesystem.exchange(
-                    self,
-                    arg.olddir,
-                    &oldname,
-                    arg.newdir,
-                    &newname,
-                    arg.options,
-                    self.reply(&ch),
-                ).await;
+                filesystem
+                    .exchange(
+                        self,
+                        arg.olddir,
+                        &oldname,
+                        arg.newdir,
+                        &newname,
+                        arg.options,
+                        self.reply(&ch),
+                    )
+                    .await;
             }
 
             #[cfg(feature = "abi-7-12")]
