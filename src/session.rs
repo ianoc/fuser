@@ -160,11 +160,14 @@ impl<FS: Filesystem> Session<FS> {
         }
     }
 
-    pub(crate) async fn spawn_worker_loop(
-        active_session: Arc<ActiveSession>,
-        ch: Arc<AsyncFd<channel::FileDescriptorRawHandle>>,
-        filesystem: Arc<FS>,
-        worker_idx: usize,
+    /// Spin around in the state waiting to ensure we are initialized.
+    /// There is a possbile race/blocking condition here in that one channel may get an init, and another channel may then
+    /// get a valid message. So while we won't process messages _before_ an init, a single channel if it gets its first message
+    /// after a different channel got the init we will need to process that as if we were in the main loop.
+    async fn wait_for_init(
+        active_session: &Arc<ActiveSession>,
+        ch: &Arc<AsyncFd<channel::FileDescriptorRawHandle>>,
+        filesystem: &Arc<FS>,
     ) -> io::Result<()> {
         let sender = ChannelSender { fd: ch.clone() };
         loop {
@@ -201,11 +204,19 @@ impl<FS: Filesystem> Session<FS> {
                     .initialized
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
-                    break;
+                    return Ok(());
                 }
             }
         }
+    }
 
+    pub(crate) async fn spawn_worker_loop(
+        active_session: Arc<ActiveSession>,
+        ch: Arc<AsyncFd<channel::FileDescriptorRawHandle>>,
+        filesystem: Arc<FS>,
+        worker_idx: usize,
+    ) -> io::Result<()> {
+        Session::wait_for_init(&active_session, &ch, &filesystem).await?;
         Session::main_request_loop(&active_session, &ch, &filesystem, worker_idx).await
     }
 
