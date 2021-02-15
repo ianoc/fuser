@@ -828,7 +828,7 @@ pub trait Filesystem: Send + Sync + 'static {
     /// FUSE_VOL_RENAME to enable
     #[cfg(target_os = "macos")]
     async fn setvolname(&self, _req: &Request<'_>, _name: &OsStr, reply: ReplyEmpty) {
-        reply.error(ENOSYS);
+        reply.error(ENOSYS).await;
     }
 
     /// macOS only (undocumented)
