@@ -107,23 +107,25 @@ impl<FS: Filesystem> Session<FS> {
         match Channel::receive(ch, buffer).await {
             Err(err) => match err.raw_os_error() {
                 // Operation interrupted. Accordingly to FUSE, this is safe to retry
-                Some(ENOENT) => return None,
+                Some(ENOENT) => None,
                 // Interrupted system call, retry
-                Some(EINTR) => return None,
+                Some(EINTR) => None,
                 // Explicitly try again
-                Some(EAGAIN) => return None,
+                Some(EAGAIN) => None,
                 // Filesystem was unmounted, quit the loop
-                Some(ENODEV) => return Some(Err(err)),
+                Some(ENODEV) => Some(Err(err)),
                 // Unhandled error
-                _ => return Some(Err(err)),
+                _ => Some(Err(err)),
             },
-            Ok(_) => {
+            Ok(Some(_)) => {
                 if let Some(req) = Request::new(buffer) {
-                    return Some(Ok(req));
+                    Some(Ok(req))
+                } else {
+                    None
                 }
             }
-        };
-        None
+            Ok(None) => None,
+        }
     }
 
     async fn main_request_loop(
@@ -146,7 +148,6 @@ impl<FS: Filesystem> Session<FS> {
 
             if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
                 let req = req_or_err?;
-
                 let filesystem = filesystem.clone();
                 let sender = sender.clone();
 
@@ -268,8 +269,14 @@ impl<FS: Filesystem> Session<FS> {
             let ch = Arc::clone(&ch);
             let active_session = Arc::clone(&active_session);
             let filesystem = Arc::clone(&filesystem);
+            let finalizer_active_session = active_session.clone();
             join_handles.push(tokio::spawn(async move {
-                Session::spawn_worker_loop(active_session, ch, filesystem, idx).await
+                let r = Session::spawn_worker_loop(active_session, ch, filesystem, idx).await;
+                // once any worker finishes/exits, then then the entire session shout be shut down.
+                finalizer_active_session
+                    .destroyed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                r
             }));
         }
 

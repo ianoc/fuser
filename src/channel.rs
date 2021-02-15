@@ -258,7 +258,10 @@ impl Channel {
         &self.mountpoint
     }
 
-    fn blocking_receive(fd: &FileDescriptorRawHandle, buffer: &mut Vec<u8>) -> io::Result<()> {
+    fn blocking_receive(
+        fd: &FileDescriptorRawHandle,
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<Option<()>> {
         let rc = unsafe {
             libc::read(
                 fd.0,
@@ -272,20 +275,34 @@ impl Channel {
             unsafe {
                 buffer.set_len(rc as usize);
             }
-            Ok(())
+            Ok(Some(()))
         }
     }
     /// Receives data up to the capacity of the given buffer (can block).
     pub(in crate) async fn receive<'a, 'b>(
         async_fd: &'a Arc<AsyncFd<FileDescriptorRawHandle>>,
         buffer: &'b mut Vec<u8>,
-    ) -> io::Result<()> {
-        loop {
-            let mut guard = async_fd.readable().await?;
+    ) -> io::Result<Option<()>> {
+        use tokio::time::timeout;
 
-            match guard.try_io(|inner| Channel::blocking_receive(inner.get_ref(), buffer)) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
+        use std::time::Duration;
+        loop {
+            // If the main session timesout/shuts down, not all of the worker fds are marked as ready
+            // this means after every second the poll request here will be aborted and we can spin around
+            // checking conditions. TODO: Probably should try solve this with a one shot channel on destruction.
+            if let Ok(guard_result) =
+                timeout(Duration::from_millis(1000), async_fd.readable()).await
+            {
+                let mut guard = guard_result?;
+
+                match guard.try_io(|inner| Channel::blocking_receive(inner.get_ref(), buffer)) {
+                    Ok(result) => return result,
+                    Err(_would_block) => {
+                        continue;
+                    }
+                }
+            } else {
+                return Ok(None);
             }
         }
     }

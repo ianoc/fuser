@@ -906,7 +906,6 @@ pub async fn mount2<FS: Filesystem, P: AsRef<Path>>(
 pub async fn mount2<FS: Filesystem, P: AsRef<Path>>(
     filesystem: FS,
     worker_channel_count: usize,
-
     mountpoint: P,
     options: &[MountOption],
 ) -> io::Result<()> {
