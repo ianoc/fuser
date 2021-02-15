@@ -1860,7 +1860,7 @@ async fn main() {
 
     fuser::mount2(
         SimpleFS::new(data_dir, matches.is_present("direct-io")),
-        10,
+        0,
         mountpoint,
         &options,
     )
