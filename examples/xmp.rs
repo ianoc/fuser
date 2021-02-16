@@ -498,7 +498,6 @@ impl Filesystem for XmpFS {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        eprintln!("Calling fsync");
         if !self.opened_files.contains_key(&fh) {
             reply.error(EIO).await;
             return;

@@ -13,23 +13,23 @@ use crate::fuse_sys::{
     fuse_session_destroy, fuse_session_fd, fuse_session_mount, fuse_session_new,
     fuse_session_unmount,
 };
-use async_trait::async_trait;
-use libc::{self, c_int, c_void, size_t, O_NONBLOCK};
+
+use libc::{self, c_int, c_void};
 use log::error;
+use log::warn;
 #[cfg(any(feature = "libfuse", test))]
 use std::ffi::OsStr;
 use std::os::unix::io::IntoRawFd;
-use std::os::unix::io::RawFd;
-use std::os::unix::{ffi::OsStrExt, prelude::AsRawFd};
+
+use crate::io_ops::{FileDescriptorRawHandle, SubChannel};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::{
     ffi::{CStr, CString},
     sync::Arc,
 };
 use std::{io, ptr};
-use tokio::io::unix::AsyncFd;
 
-use crate::reply::ReplySender;
 #[cfg(not(feature = "libfuse"))]
 use crate::MountOption;
 
@@ -59,22 +59,12 @@ fn with_fuse_args<T, F: FnOnce(&fuse_args) -> T>(options: &[&OsStr], f: F) -> T 
     })
 }
 
-/// In the latest version of rust this isn't required since RawFd implements AsRawFD
-/// but until pretty recently that didn't work. So including this wrapper is cheap and allows
-/// us better compatibility.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct FileDescriptorRawHandle(pub(in crate) RawFd);
-impl AsRawFd for FileDescriptorRawHandle {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
-    }
-}
 /// A raw communication channel to the FUSE kernel driver
 #[derive(Debug)]
 pub struct Channel {
     mountpoint: PathBuf,
     pub(in crate) session_fd: FileDescriptorRawHandle,
-    worker_fds: Vec<FileDescriptorRawHandle>,
+    pub(in crate) sub_channels: Arc<Vec<SubChannel>>,
     pub(in crate) fuse_session: *mut c_void,
 }
 
@@ -83,84 +73,107 @@ pub struct Channel {
 unsafe impl Send for Channel {}
 
 impl Channel {
-    /// Build async channels
-    /// Using the set of child raw FD's, make tokio async FD's from them for usage.
-    pub(crate) fn async_channels(&self) -> io::Result<Vec<Arc<AsyncFd<FileDescriptorRawHandle>>>> {
-        let mut r = Vec::default();
+    /// This allows file systems to work concurrently over several buffers/descriptors for concurrent operation.
+    /// More detailed description of the protocol is at:
+    /// https://john-millikin.com/the-fuse-protocol#multi-threading
+    ///
+    #[cfg(not(target_os = "macos"))]
+    fn create_worker(root_fd: &FileDescriptorRawHandle) -> io::Result<SubChannel> {
+        let fuse_device_name = "/dev/fuse";
 
-        r.push(Arc::new(AsyncFd::new(self.session_fd)?));
+        let fd = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fuse_device_name)
+        {
+            Ok(file) => file.into_raw_fd(),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::NotFound {
+                    error!("{} not found. Try 'modprobe fuse'", fuse_device_name);
+                }
+                return Err(error);
+            }
+        };
 
-        for worker in self.worker_fds.iter() {
-            r.push(Arc::new(AsyncFd::new(*worker)?));
+        let code = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        if code == -1 {
+            eprintln!("fcntl command failed with {}", code);
+            return Err(io::Error::last_os_error());
         }
 
-        Ok(r)
+        let code = unsafe { libc::ioctl(fd, FUSE_DEV_IOC_CLONE, &root_fd.0) };
+        if code == -1 {
+            eprintln!("Clone command failed with {}", code);
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(SubChannel::new(FileDescriptorRawHandle(fd), false)?)
     }
 
+    // mac fuse seems to just re-use the root fd relying onthe atomic semantics setup in the driver
+    // This will have lowerthroughput than the linux approach.
+    #[cfg(target_os = "macos")]
+    fn create_worker(root_fd: &FileDescriptorRawHandle) -> io::Result<SubChannel> {
+        SubChannel::new(*root_fd, true)
+    }
     ///
     /// Create worker fd's takes the root/session file descriptor and makes several clones
     /// This allows file systems to work concurrently over several buffers/descriptors for concurrent operation.
     /// More detailed description of the protocol is at:
     /// https://john-millikin.com/the-fuse-protocol#multi-threading
     ///
-    fn create_worker_fds(
+    fn create_sub_channels(
         root_fd: &FileDescriptorRawHandle,
         worker_channels: usize,
-    ) -> io::Result<Vec<FileDescriptorRawHandle>> {
-        let fuse_device_name = "/dev/fuse";
-
+    ) -> io::Result<Vec<SubChannel>> {
         let mut res = Vec::default();
 
+        res.push(SubChannel::new(*root_fd, false)?);
+
         for _ in 0..worker_channels {
-            let fd = match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(fuse_device_name)
-            {
-                Ok(file) => file.into_raw_fd(),
-                Err(error) => {
-                    if error.kind() == io::ErrorKind::NotFound {
-                        error!("{} not found. Try 'modprobe fuse'", fuse_device_name);
-                    }
-                    return Err(error);
-                }
-            };
-
-            let cur_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-
-            let code = unsafe { libc::fcntl(fd, libc::F_SETFL, cur_flags | O_NONBLOCK) };
-            if code == -1 {
-                eprintln!("fcntl set flags command failed with {}", code);
-                return Err(io::Error::last_os_error());
-            }
-
-            let code = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-            if code == -1 {
-                eprintln!("fcntl command failed with {}", code);
-                return Err(io::Error::last_os_error());
-            }
-
-            let code = unsafe { libc::ioctl(fd, FUSE_DEV_IOC_CLONE, &root_fd.0) };
-            if code == -1 {
-                eprintln!("Clone command failed with {}", code);
-                return Err(io::Error::last_os_error());
-            }
-
-            res.push(FileDescriptorRawHandle(fd));
+            res.push(Channel::create_worker(root_fd)?);
         }
 
         Ok(res)
     }
 
-    fn set_non_block(fd: RawFd) -> io::Result<()> {
-        let cur_flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
-
-        let code = unsafe { libc::fcntl(fd, libc::F_SETFL, cur_flags | O_NONBLOCK) };
-        if code == -1 {
-            eprintln!("fcntl set flags command failed with {}", code);
-            return Err(io::Error::last_os_error());
+    fn internal_new_on_err_cleanup(
+        mountpoint: PathBuf,
+        worker_channel_count: usize,
+        fd: FileDescriptorRawHandle,
+        fuse_session: *mut c_void,
+    ) -> io::Result<Channel> {
+        if fd.0 < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(Channel {
+                mountpoint,
+                sub_channels: Arc::new(Channel::create_sub_channels(&fd, worker_channel_count)?),
+                session_fd: fd,
+                fuse_session,
+            })
         }
-        Ok(())
+    }
+    fn new_from_session_and_fd(
+        mountpoint: &Path,
+        worker_channel_count: usize,
+        fd: FileDescriptorRawHandle,
+        fuse_session: *mut c_void,
+    ) -> io::Result<Channel> {
+        match Channel::internal_new_on_err_cleanup(
+            mountpoint.to_owned(),
+            worker_channel_count,
+            fd,
+            fuse_session,
+        ) {
+            Ok(r) => Ok(r),
+            Err(err) => {
+                if let Err(e) = unmount(mountpoint, fuse_session, fd.0) {
+                    warn!("When shutting down on error, attempted to unmount failed with error {:?}. Given failure to mount this maybe be fine.", e);
+                };
+                Err(err)
+            }
+        }
     }
     /// Create a new communication channel to the kernel driver by mounting the
     /// given path. The kernel driver will delegate filesystem operations of
@@ -178,20 +191,12 @@ impl Channel {
             let mnt = CString::new(mountpoint.as_os_str().as_bytes())?;
             let fd = unsafe { fuse_mount_compat25(mnt.as_ptr(), args) };
 
-            Channel::set_non_block(fd)?;
-
-            if fd < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                let fd = FileDescriptorRawHandle(fd);
-
-                Ok(Channel {
-                    mountpoint,
-                    worker_fds: Channel::create_worker_fds(&fd, worker_channel_count)?,
-                    session_fd: fd,
-                    fuse_session: ptr::null_mut(),
-                })
-            }
+            Channel::new_from_session_and_fd(
+                &mountpoint,
+                worker_channel_count,
+                FileDescriptorRawHandle(fd),
+                ptr::null_mut(),
+            )
         })
     }
 
@@ -214,19 +219,12 @@ impl Channel {
             }
             let fd = unsafe { fuse_session_fd(fuse_session) };
 
-            if fd < 0 {
-                Err(io::Error::last_os_error())
-            } else {
-                Channel::set_non_block(fd)?;
-
-                let fd = FileDescriptorRawHandle(fd);
-                Ok(Channel {
-                    mountpoint,
-                    worker_fds: Channel::create_worker_fds(&fd, worker_channel_count)?,
-                    session_fd: fd,
-                    fuse_session,
-                })
-            }
+            Channel::new_from_session_and_fd(
+                &mountpoint,
+                worker_channel_count,
+                FileDescriptorRawHandle(fd),
+                fuse_session,
+            )
         })
     }
 
@@ -239,18 +237,13 @@ impl Channel {
         let mountpoint = mountpoint.canonicalize()?;
 
         let fd = fuse_mount_pure(mountpoint.as_os_str(), options)?;
-        if fd < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Channel::set_non_block(fd)?;
-            let fd = FileDescriptorRawHandle(fd);
-            Ok(Channel {
-                mountpoint,
-                worker_fds: Channel::create_worker_fds(&fd, worker_channel_count)?,
-                session_fd: fd,
-                fuse_session: ptr::null_mut(),
-            })
-        }
+
+        Channel::new_from_session_and_fd(
+            &mountpoint,
+            worker_channel_count,
+            FileDescriptorRawHandle(fd),
+            ptr::null_mut(),
+        )
     }
 
     /// Return path of the mounted filesystem
@@ -258,52 +251,18 @@ impl Channel {
         &self.mountpoint
     }
 
-    fn blocking_receive(
-        fd: &FileDescriptorRawHandle,
-        buffer: &mut Vec<u8>,
-    ) -> io::Result<Option<()>> {
-        let rc = unsafe {
-            libc::read(
-                fd.0,
-                buffer.as_ptr() as *mut c_void,
-                buffer.capacity() as size_t,
-            )
-        };
-        if rc < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            unsafe {
-                buffer.set_len(rc as usize);
-            }
-            Ok(Some(()))
-        }
-    }
-    /// Receives data up to the capacity of the given buffer (can block).
     pub(in crate) async fn receive<'a, 'b>(
-        async_fd: &'a Arc<AsyncFd<FileDescriptorRawHandle>>,
+        sub_channel: &'a SubChannel,
+        terminated: &mut tokio::sync::oneshot::Receiver<()>,
         buffer: &'b mut Vec<u8>,
     ) -> io::Result<Option<()>> {
-        use tokio::time::timeout;
-
-        use std::time::Duration;
-        loop {
-            // If the main session timesout/shuts down, not all of the worker fds are marked as ready
-            // this means after every second the poll request here will be aborted and we can spin around
-            // checking conditions. TODO: Probably should try solve this with a one shot channel on destruction.
-            if let Ok(guard_result) =
-                timeout(Duration::from_millis(1000), async_fd.readable()).await
-            {
-                let mut guard = guard_result?;
-
-                match guard.try_io(|inner| Channel::blocking_receive(inner.get_ref(), buffer)) {
-                    Ok(result) => return result,
-                    Err(_would_block) => {
-                        continue;
-                    }
-                }
-            } else {
-                return Ok(None);
-            }
+        tokio::select! {
+         _ = terminated => {
+             Ok(None)
+         }
+        result = sub_channel.do_receive(buffer) => {
+             result
+         }
         }
     }
 }
@@ -314,62 +273,13 @@ impl Drop for Channel {
         // Close the communication channel to the kernel driver
         // (closing it before unnmount prevents sync unmount deadlock)
 
-        for raw_fd in self.worker_fds.iter() {
-            unsafe {
-                libc::close(raw_fd.0);
-            }
-        }
-        let handle = self.session_fd;
-        unsafe {
-            libc::close(handle.0);
+        // Close all the channel/file handles. This will include the session fd.
+        for sub_channel in self.sub_channels.iter() {
+            sub_channel.close()
         }
         // Unmount this channel's mount point
-        let _ = unmount(&self.mountpoint, self.fuse_session, handle.0);
+        let _ = unmount(&self.mountpoint, self.fuse_session, self.session_fd.0);
         self.fuse_session = ptr::null_mut(); // unmount frees this pointer
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ChannelSender {
-    pub(crate) fd: Arc<AsyncFd<FileDescriptorRawHandle>>,
-}
-
-impl ChannelSender {
-    /// Send all data in the slice of slice of bytes in a single write (can block).
-    pub async fn send(&self, buffer: &[&[u8]]) -> io::Result<()> {
-        loop {
-            let mut guard = self.fd.writable().await?;
-
-            match guard.try_io(|inner| {
-                let iovecs: Vec<_> = buffer
-                    .iter()
-                    .map(|d| libc::iovec {
-                        iov_base: d.as_ptr() as *mut c_void,
-                        iov_len: d.len() as size_t,
-                    })
-                    .collect();
-                let rc = unsafe {
-                    libc::writev(inner.get_ref().0, iovecs.as_ptr(), iovecs.len() as c_int)
-                };
-                if rc < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(())
-                }
-            }) {
-                Ok(result) => return result,
-                Err(_would_block) => continue,
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl ReplySender for ChannelSender {
-    async fn send(&self, data: &[&[u8]]) {
-        if let Err(err) = ChannelSender::send(self, data).await {
-            error!("Failed to send FUSE reply: {}", err);
-        }
     }
 }
 

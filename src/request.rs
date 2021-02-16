@@ -5,15 +5,14 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
-use crate::fuse_abi::*;
 use crate::{fuse_abi::consts::*, session::ActiveSession};
+use crate::{fuse_abi::*, io_ops::SubChannel};
 use libc::{EIO, ENOSYS, EPROTO};
 use log::{debug, error, warn};
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 use std::{convert::TryFrom, sync::Arc};
 
-use crate::channel::ChannelSender;
 #[cfg(feature = "abi-7-21")]
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplyEmpty, ReplyRaw};
@@ -57,7 +56,7 @@ impl<'a> Request<'a> {
         &self,
         se: &Arc<ActiveSession>,
         filesystem: &Arc<FS>,
-        ch: ChannelSender,
+        ch: SubChannel,
     ) {
         debug!("{}", self.request);
         match self.request.operation() {
@@ -68,8 +67,7 @@ impl<'a> Request<'a> {
                 if arg.major < 7 || (arg.major == 7 && arg.minor < 6) {
                     error!("Unsupported FUSE ABI version {}.{}", arg.major, arg.minor);
                     reply.error(EPROTO).await;
-                    se.destroyed
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    se.destroy().await;
                     return;
                 }
 
@@ -83,8 +81,7 @@ impl<'a> Request<'a> {
                 let res = filesystem.init(self, &mut config).await;
                 if let Err(err) = res {
                     reply.error(err).await;
-                    se.destroyed
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    se.destroy().await;
                     return;
                 }
                 // Reply with our desired version and settings. If the kernel supports a
@@ -136,7 +133,7 @@ impl<'a> Request<'a> {
         &self,
         active_session: &Arc<ActiveSession>,
         filesystem: Arc<FS>,
-        ch: ChannelSender,
+        ch: SubChannel,
     ) -> std::io::Result<()> {
         debug!("{}", self.request);
 
@@ -821,10 +818,7 @@ impl<'a> Request<'a> {
             }
 
             ll::Operation::Destroy => {
-                active_session
-                    .destroyed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-
+                active_session.destroy().await;
                 self.reply::<ReplyEmpty>(&ch).ok().await;
             }
         }
@@ -833,7 +827,7 @@ impl<'a> Request<'a> {
 
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
-    fn reply<T: Reply>(&self, ch: &ChannelSender) -> T {
+    fn reply<T: Reply>(&self, ch: &SubChannel) -> T {
         Reply::new(self.request.unique(), ch.clone())
     }
 

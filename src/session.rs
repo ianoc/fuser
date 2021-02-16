@@ -5,7 +5,6 @@
 //! filesystem is mounted, the session loop receives, dispatches and replies to kernel requests
 //! for filesystem operations under its mount point.
 
-use channel::{ChannelSender, FileDescriptorRawHandle};
 use futures::future::join_all;
 use libc::{EAGAIN, EINTR, ENODEV, ENOENT};
 use log::{error, info, warn};
@@ -17,13 +16,16 @@ use std::{
     io,
     sync::{atomic::AtomicBool, Arc},
 };
-use tokio::{io::unix::AsyncFd, sync::Mutex, task::JoinHandle};
+use tokio::{sync::Mutex, task::JoinHandle};
 
-use crate::channel::{self, Channel};
 use crate::request::Request;
 use crate::Filesystem;
 #[cfg(not(feature = "libfuse"))]
 use crate::MountOption;
+use crate::{
+    channel::{self, Channel},
+    io_ops::SubChannel,
+};
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,
 /// FUSE recommends at least 128k, max 16M. The FUSE default is 16M on macOS
@@ -56,15 +58,43 @@ pub(crate) struct ActiveSession {
     /// True if the filesystem is initialized (init operation done)
     pub initialized: AtomicBool,
     /// True if the filesystem was destroyed (destroy operation done)
-    pub destroyed: AtomicBool,
+    is_destroyed: AtomicBool,
+    /// Pipes to inform all of the child channels/interested parties we are shutting down
+    pub destroy_signals: Arc<Mutex<Vec<tokio::sync::oneshot::Sender<()>>>>,
 }
 
+impl ActiveSession {
+    pub(in crate::session) async fn register_destroy(
+        &self,
+        sender: tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut guard = self.destroy_signals.lock().await;
+        guard.push(sender)
+    }
+
+    pub(in crate) fn destroyed(&self) -> bool {
+        self.is_destroyed.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(in crate) async fn destroy(&self) {
+        self.is_destroyed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.destroy_signals.lock().await;
+
+        for e in guard.drain(..) {
+            if let Err(e) = e.send(()) {
+                warn!("Unable to send a shutdown signal: {:?}", e);
+            }
+        }
+    }
+}
 impl Default for ActiveSession {
     fn default() -> Self {
         Self {
             session_configuration: Arc::new(Mutex::new(Default::default())),
             initialized: AtomicBool::new(false),
-            destroyed: AtomicBool::new(false),
+            is_destroyed: AtomicBool::new(false),
+            destroy_signals: Arc::new(Mutex::new(Vec::default())),
         }
     }
 }
@@ -78,8 +108,8 @@ impl<FS: Filesystem> Session<FS> {
         mountpoint: &Path,
         options: &[&OsStr],
     ) -> io::Result<Session<FS>> {
-        info!("Mounting {}", mountpoint.display());
-        Channel::new(mountpoint, worker_channel_count, options).map(|ch| Session { filesystem, ch })
+        let ch = Channel::new(mountpoint, worker_channel_count, options)?;
+        Ok(Session { filesystem, ch })
     }
 
     /// Create a new session by mounting the given filesystem to the given mountpoint
@@ -101,10 +131,11 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     async fn read_single_request<'a, 'b>(
-        ch: &Arc<AsyncFd<FileDescriptorRawHandle>>,
+        ch: &SubChannel,
+        terminated: &mut tokio::sync::oneshot::Receiver<()>,
         buffer: &'b mut Vec<u8>,
     ) -> Option<io::Result<Request<'b>>> {
-        match Channel::receive(ch, buffer).await {
+        match Channel::receive(ch, terminated, buffer).await {
             Err(err) => match err.raw_os_error() {
                 // Operation interrupted. Accordingly to FUSE, this is safe to retry
                 Some(ENOENT) => None,
@@ -130,23 +161,23 @@ impl<FS: Filesystem> Session<FS> {
 
     async fn main_request_loop(
         active_session: &Arc<ActiveSession>,
-        ch: &Arc<AsyncFd<FileDescriptorRawHandle>>,
+        ch: &SubChannel,
+        terminated: &mut tokio::sync::oneshot::Receiver<()>,
         filesystem: &Arc<FS>,
         _worker_idx: usize,
     ) -> io::Result<()> {
         let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
 
-        let sender = ChannelSender { fd: ch.clone() };
+        let sender = ch.clone();
 
         loop {
-            if active_session
-                .destroyed
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if active_session.destroyed() {
                 return Ok(());
             }
 
-            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
+            if let Some(req_or_err) =
+                Session::<FS>::read_single_request(&ch, terminated, &mut buffer).await
+            {
                 let req = req_or_err?;
                 let filesystem = filesystem.clone();
                 let sender = sender.clone();
@@ -167,21 +198,21 @@ impl<FS: Filesystem> Session<FS> {
     /// after a different channel got the init we will need to process that as if we were in the main loop.
     async fn wait_for_init(
         active_session: &Arc<ActiveSession>,
-        ch: &Arc<AsyncFd<channel::FileDescriptorRawHandle>>,
+        ch: &SubChannel,
+        terminated: &mut tokio::sync::oneshot::Receiver<()>,
         filesystem: &Arc<FS>,
     ) -> io::Result<()> {
-        let sender = ChannelSender { fd: ch.clone() };
+        let sender = ch.clone();
         loop {
             let mut buffer: Vec<u8> = Vec::with_capacity(BUFFER_SIZE);
 
-            if active_session
-                .destroyed
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if active_session.destroyed() {
                 return Ok(());
             }
 
-            if let Some(req_or_err) = Session::<FS>::read_single_request(&ch, &mut buffer).await {
+            if let Some(req_or_err) =
+                Session::<FS>::read_single_request(&ch, terminated, &mut buffer).await
+            {
                 let req = req_or_err?;
                 if !active_session
                     .initialized
@@ -213,12 +244,20 @@ impl<FS: Filesystem> Session<FS> {
 
     pub(crate) async fn spawn_worker_loop(
         active_session: Arc<ActiveSession>,
-        ch: Arc<AsyncFd<channel::FileDescriptorRawHandle>>,
+        ch: SubChannel,
+        mut terminated: tokio::sync::oneshot::Receiver<()>,
         filesystem: Arc<FS>,
         worker_idx: usize,
     ) -> io::Result<()> {
-        Session::wait_for_init(&active_session, &ch, &filesystem).await?;
-        Session::main_request_loop(&active_session, &ch, &filesystem, worker_idx).await
+        Session::wait_for_init(&active_session, &ch, &mut terminated, &filesystem).await?;
+        Session::main_request_loop(
+            &active_session,
+            &ch,
+            &mut terminated,
+            &filesystem,
+            worker_idx,
+        )
+        .await
     }
 
     async fn driver_evt_loop(
@@ -227,15 +266,12 @@ impl<FS: Filesystem> Session<FS> {
         mut filesystem: Arc<FS>,
         channel: Channel,
     ) -> io::Result<()> {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
 
         loop {
             interval.tick().await;
 
-            if active_session
-                .destroyed
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+            if active_session.destroyed() {
                 loop {
                     if let Some(fs) = Arc::get_mut(&mut filesystem) {
                         fs.destroy();
@@ -251,6 +287,7 @@ impl<FS: Filesystem> Session<FS> {
             }
         }
     }
+
     /// Run the session loop that receives kernel requests and dispatches them to method
     /// calls into the filesystem. This spawns as a task in tokio returning that task
     pub async fn spawn_run(self) -> io::Result<JoinHandle<io::Result<()>>> {
@@ -262,20 +299,20 @@ impl<FS: Filesystem> Session<FS> {
         let active_session = Arc::new(ActiveSession::default());
         let filesystem = Arc::new(filesystem);
 
-        let communication_channels = channel.async_channels()?;
-
         let mut join_handles: Vec<JoinHandle<Result<(), io::Error>>> = Vec::default();
-        for (idx, ch) in communication_channels.iter().enumerate() {
-            let ch = Arc::clone(&ch);
+        for (idx, ch) in channel.sub_channels.iter().enumerate() {
+            let ch = ch.clone();
             let active_session = Arc::clone(&active_session);
             let filesystem = Arc::clone(&filesystem);
             let finalizer_active_session = active_session.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+
+            active_session.register_destroy(sender).await;
             join_handles.push(tokio::spawn(async move {
-                let r = Session::spawn_worker_loop(active_session, ch, filesystem, idx).await;
+                let r =
+                    Session::spawn_worker_loop(active_session, ch, receiver, filesystem, idx).await;
                 // once any worker finishes/exits, then then the entire session shout be shut down.
-                finalizer_active_session
-                    .destroyed
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                finalizer_active_session.destroy().await;
                 r
             }));
         }
@@ -309,7 +346,7 @@ pub struct BackgroundSession {
     /// Thread guard of the background session
     pub guard: JoinHandle<io::Result<()>>,
     fuse_session: *mut libc::c_void,
-    fd: FileDescriptorRawHandle,
+    fd: crate::io_ops::FileDescriptorRawHandle,
 }
 
 impl BackgroundSession {
