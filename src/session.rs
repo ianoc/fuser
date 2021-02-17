@@ -109,6 +109,7 @@ impl<FS: Filesystem> Session<FS> {
         options: &[&OsStr],
     ) -> io::Result<Session<FS>> {
         let ch = Channel::new(mountpoint, worker_channel_count, options)?;
+        eprintln!("Channel made, make session");
         Ok(Session { filesystem, ch })
     }
 
@@ -136,7 +137,9 @@ impl<FS: Filesystem> Session<FS> {
         buffer: &'b mut Vec<u8>,
     ) -> Option<io::Result<Request<'b>>> {
         match Channel::receive(ch, terminated, buffer).await {
-            Err(err) => match err.raw_os_error() {
+            Err(err) => {
+                eprintln!("[pid={}] Saw error: {:?}", std::process::id(), err);
+                match err.raw_os_error() {
                 // Operation interrupted. Accordingly to FUSE, this is safe to retry
                 Some(ENOENT) => None,
                 // Interrupted system call, retry
@@ -147,7 +150,7 @@ impl<FS: Filesystem> Session<FS> {
                 Some(ENODEV) => Some(Err(err)),
                 // Unhandled error
                 _ => Some(Err(err)),
-            },
+            }},
             Ok(Some(_)) => {
                 if let Some(req) = Request::new(buffer) {
                     Some(Ok(req))
@@ -170,6 +173,7 @@ impl<FS: Filesystem> Session<FS> {
 
         let sender = ch.clone();
 
+        eprintln!("entered main request loop");
         loop {
             if active_session.destroyed() {
                 return Ok(());
@@ -182,9 +186,14 @@ impl<FS: Filesystem> Session<FS> {
                 let filesystem = filesystem.clone();
                 let sender = sender.clone();
 
+                // eprintln!("[{}] Enter dispatch for {}", std::process::id(), req.request);
                 match req.dispatch(&active_session, filesystem, sender).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        // eprintln!("[{}] Dispatch completed", std::process::id());
+                    }
                     Err(e) => {
+                        eprintln!("Dispatch failed");
+
                         warn!("I/O failure in dispatch paths: {:#?}", e);
                     }
                 };
@@ -224,8 +233,11 @@ impl<FS: Filesystem> Session<FS> {
                     let filesystem = filesystem.clone();
                     let sender = sender.clone();
 
+                    // eprintln!("[pid={}] Entering dispatch for {}", std::process::id(), req.request);
                     match req.dispatch(&active_session, filesystem, sender).await {
-                        Ok(_) => {}
+                        Ok(_) => {
+                        //  eprintln!("[pid={}] finished dispatch for {}", std::process::id(), req.request);
+                        }
                         Err(e) => {
                             warn!("I/O failure in dispatch paths: {:#?}", e);
                         }
@@ -261,31 +273,31 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     async fn driver_evt_loop(
-        active_session: Arc<ActiveSession>,
+        _active_session: Arc<ActiveSession>,
         join_handles: Vec<JoinHandle<Result<(), io::Error>>>,
+        terminated: tokio::sync::oneshot::Receiver<()>,
         mut filesystem: Arc<FS>,
         channel: Channel,
     ) -> io::Result<()> {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
-
-        loop {
-            interval.tick().await;
-
-            if active_session.destroyed() {
+            eprintln!("[pid={}] Tick start", std::process::id());
+            let _ = terminated.await;
+            eprintln!("[pid={}] Tick completed", std::process::id());
+                eprintln!("Noticed destroy, attempting to acquire the fs.");
                 loop {
                     if let Some(fs) = Arc::get_mut(&mut filesystem) {
                         fs.destroy();
                         break;
                     }
                 }
+                eprintln!("Dropping channel...");
+                drop(channel);
 
                 for ret in join_all(join_handles).await {
-                    let _ = ret?;
+                    if let Err(e) = ret {
+                        warn!("Error joining worker of {:?}", e);
+                    }
                 }
-                drop(channel);
                 return Ok(());
-            }
-        }
     }
 
     /// Run the session loop that receives kernel requests and dispatches them to method
@@ -298,7 +310,8 @@ impl<FS: Filesystem> Session<FS> {
 
         let active_session = Arc::new(ActiveSession::default());
         let filesystem = Arc::new(filesystem);
-
+        let (sender, driver_receiver) = tokio::sync::oneshot::channel();
+        active_session.register_destroy(sender).await;
         let mut join_handles: Vec<JoinHandle<Result<(), io::Error>>> = Vec::default();
         for (idx, ch) in channel.sub_channels.iter().enumerate() {
             let ch = ch.clone();
@@ -312,7 +325,9 @@ impl<FS: Filesystem> Session<FS> {
                 let r =
                     Session::spawn_worker_loop(active_session, ch, receiver, filesystem, idx).await;
                 // once any worker finishes/exits, then then the entire session shout be shut down.
+                eprintln!("[pid={}] Worker loop terminated", std::process::id());
                 finalizer_active_session.destroy().await;
+                eprintln!("[pid={}] Worker loop terminated returning", std::process::id());
                 r
             }));
         }
@@ -320,6 +335,7 @@ impl<FS: Filesystem> Session<FS> {
         Ok(tokio::task::spawn(Session::driver_evt_loop(
             active_session,
             join_handles,
+            driver_receiver,
             filesystem,
             channel,
         )))

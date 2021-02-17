@@ -914,6 +914,7 @@ pub async fn mount2<FS: Filesystem, P: AsRef<Path>>(
     let options: Vec<String> = options.iter().map(|x| option_to_string(x)).collect();
     let option_str = options.join(",");
     let args = vec![OsStr::new("-o"), OsStr::new(&option_str)];
+    eprintln!("Make session..");
     let session = Session::new(filesystem, worker_channel_count, mountpoint.as_ref(), &args)?;
     session.run().await
 }

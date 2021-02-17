@@ -7,13 +7,9 @@ RUN adduser --disabled-password --gecos '' fsgqa
 
 RUN echo 'user_allow_other' >> /etc/fuse.conf
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=1.47.0
-
 ENV PATH=/root/.cargo/bin:$PATH
 
 RUN mkdir -p /code && cd /code && git clone https://github.com/fleetfs/fuse-xfstests && cd fuse-xfstests \
   && git checkout 0166199783962f0d988dfc5fbfea6aba4ac9143f && make
 
 ADD . /code/fuser/
-
-RUN cd /code/fuser && cargo build --release --examples --features=abi-7-28 && cp target/release/examples/simple /bin/fuser

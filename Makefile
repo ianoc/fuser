@@ -7,17 +7,20 @@ build: pre
 
 pre:
 	cargo fmt --all -- --check
-	cargo deny check licenses
+	#cargo deny check licenses
 	cargo clippy --all-targets
 	cargo clippy --all-targets --no-default-features
 	cargo clippy --all-targets --features=abi-7-30
 
 xfstests:
+	#rsync -aP src/ fuser-tmp/src/
+	#rsync -aP xfstests.sh fuser-tmp/
 	docker build -t fuser:xfstests -f xfstests.Dockerfile .
+	mkdir -p /tmp/docker-cargo /tmp/docker-target /tmp/docker-rustup
 	# Additional permissions are needed to be able to mount FUSE
 	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
 	 --memory=2g --kernel-memory=200m \
-	 -v "$(shell pwd)/logs:/code/logs" fuser:xfstests bash -c "cd /code/fuser && ./xfstests.sh"
+	 -v "$(shell pwd)/logs:/code/logs" -v "/tmp/docker-target:/code/fuser/target" -v "/tmp/docker-cargo:/root/.cargo" -v "/tmp/docker-rustup:/root/.rustup" fuser:xfstests bash -c "cd /code/fuser && ./xfstests.sh"
 
 pjdfs_tests: pjdfs_tests_fuse2 pjdfs_tests_fuse3 pjdfs_tests_pure
 

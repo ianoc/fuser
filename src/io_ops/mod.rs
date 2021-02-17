@@ -35,14 +35,14 @@ fn blocking_receive(fd: &FileDescriptorRawHandle, buffer: &mut Vec<u8>) -> io::R
     }
 }
 
-#[cfg(target_os = "macos")]
+//#[cfg(target_os = "macos")]
 pub mod blocking_io;
 
-#[cfg(target_os = "macos")]
+//#[cfg(target_os = "macos")]
 pub(crate) use blocking_io::SubChannel;
 
-#[cfg(not(target_os = "macos"))]
-pub mod nonblocking_io;
+//#[cfg(not(target_os = "macos"))]
+//pub mod nonblocking_io;
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) use nonblocking_io::SubChannel;
+//#[cfg(not(target_os = "macos"))]
+//pub(crate) use nonblocking_io::SubChannel;

@@ -2,6 +2,19 @@
 
 set -ex
 
+
+if [ ! -d /root/.rustup/toolchains/stable-x86_64-unknown-linux-gnu ]; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain=1.47.0
+fi
+
+export PATH=/root/.cargo/bin:$PATH
+
+rustup default 1.47.0
+cd /code/fuser
+cargo +1.47.0 build --release --examples --features=abi-7-28
+cp target/release/examples/simple /bin/fuser
+
+
 exit_handler() {
     exit "$XFSTESTS_EXIT_STATUS"
 }
@@ -49,6 +62,9 @@ echo "generic/103" >> xfs_excludes.txt
 # TODO: requires support for mknod on character files
 echo "generic/184" >> xfs_excludes.txt
 echo "generic/401" >> xfs_excludes.txt
+
+echo "generic/006" >> xfs_excludes.txt
+echo "generic/007" >> xfs_excludes.txt
 
 # TODO: requires fifo support
 echo "generic/423" >> xfs_excludes.txt
@@ -124,18 +140,29 @@ echo "generic/391" >> xfs_excludes.txt
 echo "generic/426" >> xfs_excludes.txt
 echo "generic/467" >> xfs_excludes.txt
 echo "generic/477" >> xfs_excludes.txt
+echo "generic/001" >> xfs_excludes.txt
+echo "generic/008" >> xfs_excludes.txt
+echo "generic/009" >> xfs_excludes.txt
+echo "generic/010" >> xfs_excludes.txt
+echo "generic/011" >> xfs_excludes.txt
+echo "generic/012" >> xfs_excludes.txt
+echo "generic/013" >> xfs_excludes.txt
+echo "generic/036" >> xfs_excludes.txt
 
 FUSER_EXTRA_MOUNT_OPTIONS="" TEST_DEV="$TEST_DATA_DIR" TEST_DIR="$TEST_DIR" SCRATCH_DEV="$SCRATCH_DATA_DIR" SCRATCH_MNT="$SCRATCH_DIR" \
-./check-fuser -E xfs_excludes.txt \
+./check-fuser generic/037 \
 | tee /code/logs/xfstests.log
-
+# -E xfs_excludes.txt 
+#035 or 037
 export XFSTESTS_EXIT_STATUS=${PIPESTATUS[0]}
 
-if [ $XFSTESTS_EXIT_STATUS ]
-then
-  cat /code/fuse-xfstests/results/generic/*.bad
-  cp /code/fuse-xfstests/results/generic/*.bad /code/logs/
-fi
+diff -u tests/generic/037.out /code/fuse-xfstests/results//generic/037.out.bad
+
+# if [ $XFSTESTS_EXIT_STATUS ]
+# then
+#   cat /code/fuse-xfstests/results/generic/*.bad
+#   cp /code/fuse-xfstests/results/generic/*.bad /code/logs/
+# fi
 
 rm -rf ${TEST_DATA_DIR}
 rm -rf ${TEST_DIR}

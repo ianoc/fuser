@@ -101,6 +101,7 @@ impl Channel {
             return Err(io::Error::last_os_error());
         }
 
+        eprintln!("Calling the FUSE_DEV_IOC_CLONE");
         let code = unsafe { libc::ioctl(fd, FUSE_DEV_IOC_CLONE, &root_fd.0) };
         if code == -1 {
             eprintln!("Clone command failed with {}", code);
@@ -143,16 +144,14 @@ impl Channel {
         fd: FileDescriptorRawHandle,
         fuse_session: *mut c_void,
     ) -> io::Result<Channel> {
-        if fd.0 < 0 {
-            Err(io::Error::last_os_error())
-        } else {
+        eprintln!("internal_new_on_err_cleanup: Internal make channel code");
+     
             Ok(Channel {
                 mountpoint,
                 sub_channels: Arc::new(Channel::create_sub_channels(&fd, worker_channel_count)?),
                 session_fd: fd,
                 fuse_session,
             })
-        }
     }
     fn new_from_session_and_fd(
         mountpoint: &Path,
@@ -168,6 +167,7 @@ impl Channel {
         ) {
             Ok(r) => Ok(r),
             Err(err) => {
+                eprintln!("new_from_session_and_fd error: {:?}", err);
                 if let Err(e) = unmount(mountpoint, fuse_session, fd.0) {
                     warn!("When shutting down on error, attempted to unmount failed with error {:?}. Given failure to mount this maybe be fine.", e);
                 };
@@ -187,10 +187,16 @@ impl Channel {
     ) -> io::Result<Channel> {
         let mountpoint = mountpoint.canonicalize()?;
 
+        eprintln!("Entered libfuse2, Channel::new for {:?} ", mountpoint);
         with_fuse_args(options, |args| {
             let mnt = CString::new(mountpoint.as_os_str().as_bytes())?;
             let fd = unsafe { fuse_mount_compat25(mnt.as_ptr(), args) };
-
+            if fd < 0 {
+                let e = Err(io::Error::last_os_error());
+                eprintln!("fuse_mount_compat25 failed with {:?}", e);
+                return e;
+            }
+            eprintln!("Got fd: {:?}", fd);
             Channel::new_from_session_and_fd(
                 &mountpoint,
                 worker_channel_count,
@@ -218,7 +224,9 @@ impl Channel {
                 return Err(io::Error::last_os_error());
             }
             let fd = unsafe { fuse_session_fd(fuse_session) };
-
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
             Channel::new_from_session_and_fd(
                 &mountpoint,
                 worker_channel_count,
@@ -237,7 +245,6 @@ impl Channel {
         let mountpoint = mountpoint.canonicalize()?;
 
         let fd = fuse_mount_pure(mountpoint.as_os_str(), options)?;
-
         Channel::new_from_session_and_fd(
             &mountpoint,
             worker_channel_count,
@@ -274,11 +281,15 @@ impl Drop for Channel {
         // (closing it before unnmount prevents sync unmount deadlock)
 
         // Close all the channel/file handles. This will include the session fd.
+        eprintln!("Have {} subchannels", self.sub_channels.len());
         for sub_channel in self.sub_channels.iter() {
             sub_channel.close()
         }
-        // Unmount this channel's mount point
+
+        eprintln!("Unmounting {:?}", self.mountpoint);
         let _ = unmount(&self.mountpoint, self.fuse_session, self.session_fd.0);
+
+        // Unmount this channel's mount point
         self.fuse_session = ptr::null_mut(); // unmount frees this pointer
     }
 }
@@ -345,9 +356,15 @@ pub fn unmount(mountpoint: &Path, fuse_session: *mut c_void, fd: c_int) -> io::R
     }
 
     let mnt = CString::new(mountpoint.as_os_str().as_bytes())?;
+    eprintln!("[pid={}] In umount, calling libc function on {:?}", std::process::id(), mnt);
     let rc = libc_umount(&mnt, fuse_session, fd);
+    
     if rc < 0 {
-        Err(io::Error::last_os_error())
+        let randv = rand::random::<u128>();
+        let e = io::Error::last_os_error();
+        eprintln!("[pid={}][rd:{}] - umount failed {:?}", std::process::id(), randv, e);
+
+        Err(e)
     } else {
         Ok(())
     }

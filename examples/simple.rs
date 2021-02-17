@@ -221,6 +221,7 @@ impl From<InodeAttributes> for fuser::FileAttr {
 // Stores inode metadata data in "$data_dir/inodes" and file contents in "$data_dir/contents"
 // Directory data is stored in the file's contents, as a serialized DirectoryDescriptor
 struct SimpleFS {
+    lock: tokio::sync::Mutex<std::sync::Arc<bool>>,
     data_dir: String,
     next_file_handle: AtomicU64,
     direct_io: bool,
@@ -229,6 +230,7 @@ struct SimpleFS {
 impl SimpleFS {
     fn new(data_dir: String, direct_io: bool) -> SimpleFS {
         SimpleFS {
+            lock: Default::default(),
             data_dir,
             next_file_handle: AtomicU64::new(1),
             direct_io,
@@ -427,6 +429,7 @@ impl SimpleFS {
 #[async_trait::async_trait]
 impl Filesystem for SimpleFS {
     async fn init(&self, _req: &Request<'_>, _config: &mut KernelConfig) -> Result<(), c_int> {
+        let _ = self.lock.lock().await;
         fs::create_dir_all(Path::new(&self.data_dir).join("inodes")).unwrap();
         fs::create_dir_all(Path::new(&self.data_dir).join("contents")).unwrap();
         if self.get_inode(FUSE_ROOT_ID).is_err() {
@@ -456,6 +459,7 @@ impl Filesystem for SimpleFS {
     fn destroy(&mut self) {}
 
     async fn lookup(&self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let _ = self.lock.lock().await;
         if name.len() > MAX_NAME_LENGTH as usize {
             reply.error(libc::ENAMETOOLONG).await;
             return;
@@ -482,6 +486,7 @@ impl Filesystem for SimpleFS {
     async fn forget(&self, _req: &Request<'_>, _ino: u64, _nlookup: u64) {}
 
     async fn getattr(&self, _req: &Request<'_>, inode: u64, reply: ReplyAttr) {
+        let _ = self.lock.lock().await;
         match self.get_inode(inode) {
             Ok(attrs) => reply.attr(&Duration::new(0, 0), &attrs.into()).await,
             Err(error_code) => reply.error(error_code).await,
@@ -506,6 +511,7 @@ impl Filesystem for SimpleFS {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        let _ = self.lock.lock().await;
         let mut attrs = match self.get_inode(inode) {
             Ok(attrs) => attrs,
             Err(error_code) => {
@@ -651,6 +657,7 @@ impl Filesystem for SimpleFS {
     }
 
     async fn readlink(&self, _req: &Request<'_>, inode: u64, reply: ReplyData) {
+        let _ = self.lock.lock().await;
         debug!("readlink() called on {:?}", inode);
         let path = self.content_path(inode);
         if let Ok(mut file) = File::open(&path) {
@@ -673,6 +680,7 @@ impl Filesystem for SimpleFS {
         _rdev: u32,
         reply: ReplyEntry,
     ) {
+        let _ = self.lock.lock().await;
         let file_type = mode & libc::S_IFMT as u32;
 
         if file_type != libc::S_IFREG as u32
@@ -756,6 +764,7 @@ impl Filesystem for SimpleFS {
         _umask: u32,
         reply: ReplyEntry,
     ) {
+        let _ = self.lock.lock().await;
         debug!("mkdir() called with {:?} {:?} {:o}", parent, name, mode);
         if self.lookup_name(parent, name).is_ok() {
             reply.error(libc::EEXIST).await;
@@ -816,6 +825,7 @@ impl Filesystem for SimpleFS {
     }
 
     async fn unlink(&self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let _ = self.lock.lock().await;
         debug!("unlink() called with {:?} {:?}", parent, name);
         let mut attrs = match self.lookup_name(parent, name) {
             Ok(attrs) => attrs,
@@ -1857,7 +1867,14 @@ async fn main() {
         .value_of("mount-point")
         .unwrap_or_default()
         .to_string();
+eprintln!("Starting mount: {}", mountpoint);
 
+std::fs::create_dir_all(&mountpoint).unwrap();
+let output = std::process::Command::new("mount")
+            .output()
+            .expect("failed to execute process");
+eprintln!("[pid={}] Mount output: \n{}", std::process::id(), std::str::from_utf8(&output.stdout).unwrap());
+//eprintln!("{} Mount output: \n{}", std::process::id(), std::str::from_utf8(&output.stdout).unwrap().lines().filter(|e| e.contains("fuse")).collect::<Vec<&str>>().join("\n"));
     fuser::mount2(
         SimpleFS::new(data_dir, matches.is_present("direct-io")),
         0,
@@ -1866,4 +1883,7 @@ async fn main() {
     )
     .await
     .unwrap();
+
+eprintln!("Exiting normally...");
+
 }

@@ -58,9 +58,12 @@ impl SubChannel {
 
     pub fn close(&self) {
         if !self.shared {
+            eprintln!("Calling libc close");
             unsafe {
                 libc::close(self.fd.get_ref().0);
             }
+        } else {
+            eprintln!("Shared, not calling close");
         }
     }
 
