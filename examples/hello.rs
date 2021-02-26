@@ -1,6 +1,6 @@
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request,
+    ReplyStatfs, Request,
 };
 use libc::ENOENT;
 use std::env;
@@ -112,6 +112,12 @@ impl Filesystem for HelloFS {
             }
         }
         reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request<'_>, _ino: u64, reply: ReplyStatfs) {
+        reply.statfs(0, 0, 0, 0, 0, 512, 255, 0);
+        use std::thread;
+        thread::sleep(std::time::Duration::from_secs(6));
     }
 }
 

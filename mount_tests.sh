@@ -67,4 +67,43 @@ echo 'user_allow_other' >> /etc/fuse.conf
 run_test --features=libfuse,abi-7-30 'with libfuse3'
 run_test --features=libfuse,abi-7-30 'with libfuse3' --auto_unmount
 
+
+# Tests to check for auto-unmount mixing poorly with multiple mounts
+apt remove --purge -y fuse3
+apt autoremove -y
+apt install -y libfuse-dev pkg-config fuse
+echo 'user_allow_other' >> /etc/fuse.conf
+
+cargo build --example hello --features=libfuse > /dev/null 2>&1
+cargo run --example hello --features=libfuse -- $DIR --auto_unmount &
+FUSE_PID_A=$!
+sleep 2
+
+# Make sure FUSE was successfully mounted
+mount | grep hello || exit 1
+
+# We put the sleep on release, which won't get called unless we cat something
+cat ${DIR}/hello.txt
+umount ${DIR}
+
+cargo run --example hello --features=libfuse -- $DIR --auto_unmount &
+FUSE_PID_B=$!
+sleep 2
+# Make sure FUSE was successfully mounted
+mount | grep hello || exit 1
+
+sleep 7
+if [[ $(cat ${DIR}/hello.txt) = "Hello World!" ]]; then
+    echo -e "$GREEN OK $DIR --auto_unmount $NC"
+else
+    echo -e "$RED FAILED $DIR --auto_unmount $NC"
+    export TEST_EXIT_STATUS=1
+    exit 1
+fi
+
+kill $FUSE_PID_A &> /dev/null
+kill $FUSE_PID_B &> /dev/null
+wait $FUSE_PID_A
+wait $FUSE_PID_B
+
 export TEST_EXIT_STATUS=0
