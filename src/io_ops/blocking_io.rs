@@ -2,7 +2,7 @@ use super::FileDescriptorRawHandle;
 use async_trait::async_trait;
 use libc::{self, c_int, c_void, size_t};
 use log::error;
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 #[derive(Debug, Clone)]
 pub struct SubChannel {
