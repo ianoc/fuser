@@ -14,7 +14,7 @@ impl SubChannel {
         &self.fd
     }
 
-    pub fn new(fd: FileDescriptorRawHandle) -> io::Result<SubChannel> {
+    pub fn new(fd: FileDescriptorRawHandle, _max_poll_timeout: Duration) -> io::Result<SubChannel> {
         Ok(SubChannel { fd: Arc::new(fd) })
     }
 
