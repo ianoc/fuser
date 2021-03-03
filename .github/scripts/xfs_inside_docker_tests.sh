@@ -23,7 +23,7 @@ cd /code/fuser/fuser${SUFFIX}
 
 cargo build --release --examples --features=abi-7-28
 
-cp target/release/examples/simple$SUFFIX /bin/fuser
+cp ../target/release/examples/simple$SUFFIX /bin/fuser
 
 cd /code/fuser
 exec ./xfstests.sh "$@"
