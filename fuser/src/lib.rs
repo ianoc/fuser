@@ -41,9 +41,12 @@ use std::cmp::max;
 use std::cmp::min;
 
 mod channel;
-mod fuse_sys;
-mod ll;
-mod mount_options;
+/// TODO we need to decide how much of this privacy we can unwind and what needs to be exposed to build other implementations.
+pub mod fuse_sys;
+/// TODO we need to decide how much of this privacy we can unwind and what needs to be exposed to build other implementations.
+pub mod ll;
+/// TODO we need to decide how much of this privacy we can unwind and what needs to be exposed to build other implementations.
+pub mod mount_options;
 mod reply;
 mod request;
 mod session;
