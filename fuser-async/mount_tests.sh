@@ -16,8 +16,8 @@ RED="\e[31m"
 
 function run_test {
   DIR=$(mktemp --directory)
-  cargo build --example hello $1 > /dev/null 2>&1
-  cargo run --example hello $1 -- $DIR $3 &
+  cargo build --example hello-async $1 > /dev/null 2>&1
+  cargo run --example hello-async $1 -- $DIR $3 &
   FUSE_PID=$!
   sleep 2
 

@@ -19,7 +19,7 @@ if [ ! -f /code/fuse-xfstests/check ]; then
     make
 fi
 
-cd /code/fuser/fuser-${SUFFIX}
+cd /code/fuser/fuser${SUFFIX}
 
 cargo build --release --examples --features=abi-7-28
 
