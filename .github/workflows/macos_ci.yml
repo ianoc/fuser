@@ -46,4 +46,6 @@ jobs:
       - name: Run cargo doc for all features
         run: cargo doc --all --no-deps --all-features
       - name: Run macos mount tests
-        run: bash osx_mount_tests.sh
+        run: |
+          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          bash ../osx_mount_tests.sh
