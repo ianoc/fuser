@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 
 set -x
-SUFFIX=$!
+SUFFIX=$1
 shift
+if [ "$SUFFIX"  == "__ignore__" ]; then
+    SUFFIX=""
+fi
 
 exit_handler() {
     exit "${TEST_EXIT_STATUS:-1}"

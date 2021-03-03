@@ -7,7 +7,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        suffix: ["", "-async"]
+        suffix: ["__ignore__", "-async"]
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
     steps:
@@ -55,4 +55,4 @@ jobs:
       - name: Run macos mount tests
         run: |
           cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
-          bash ../osx_mount_tests.sh ${{ matrix.suffix }}
+          ../osx_mount_tests.sh ${{ matrix.suffix }}

@@ -46,7 +46,7 @@ jobs:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
-        suffix: ["", "-async"]
+        suffix: ["__ignore__", "-async"]
         test_group: ["generic/0*", "generic/1*", "generic/2*", "generic/3*", "generic/4*", "generic/5*", "generic/6*"]
     steps:
       - uses: actions/checkout@v2

@@ -3,6 +3,9 @@
 set -e
 SUFFIX=$1
 shift
+if [ "$SUFFIX"  == "__ignore__" ]; then
+    SUFFIX=""
+fi
 
 # Check for rustup installed
 if [ ! -f ~/.rustup/settings.toml ]; then
