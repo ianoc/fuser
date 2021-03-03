@@ -40,8 +40,7 @@ pjdfs_tests_pure:
 	 -v "$(shell pwd)/logs:/code/logs" fuser:pjdfs bash -c "cd /code/fuser && ./pjdfs.sh"
 
 mount_tests:
-	cd ..
-	docker build -t fuser:mount_tests -f fuser-async/mount_tests.Dockerfile .
+	docker build -t fuser:mount_tests -f fuser-async/mount_tests.Dockerfile ..
 	# Additional permissions are needed to be able to mount FUSE
 	docker run --rm -$(INTERACTIVE)t --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined \
 	 fuser:mount_tests bash -c "cd /code/fuser/fuser-async && bash ./mount_tests.sh"
