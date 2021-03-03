@@ -61,5 +61,5 @@ jobs:
           cargo doc --all --no-deps --all-features
       - name: Run macos mount tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
+          cd $GITHUB_WORKSPACE/${{ matrix.sub_path }}
           ../osx_mount_tests.sh ${{ matrix.suffix }}
