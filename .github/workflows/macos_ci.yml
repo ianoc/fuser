@@ -41,25 +41,25 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
       - name: Build all targets
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           cargo build --all --all-targets
       - name: Build all targets, all features
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           cargo build --all --all-targets --all-features
       - name: Run all tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           cargo test --all
       - name: Run all tests, all features
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           cargo test --all --all-features
       - name: Run cargo doc for all features
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           cargo doc --all --no-deps --all-features
       - name: Run macos mount tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.sub_path }}
           ../osx_mount_tests.sh ${{ matrix.suffix }}
