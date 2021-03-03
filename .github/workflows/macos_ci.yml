@@ -8,7 +8,6 @@ jobs:
     strategy:
       matrix:
         suffix: ["", "-async"]
-        flavor: [fuser, fuser-async]
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
     steps:
@@ -35,25 +34,25 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
       - name: Build all targets
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           cargo build --all --all-targets
       - name: Build all targets, all features
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           cargo build --all --all-targets --all-features
       - name: Run all tests
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           cargo test --all
       - name: Run all tests, all features
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           cargo test --all --all-features
       - name: Run cargo doc for all features
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           cargo doc --all --no-deps --all-features
       - name: Run macos mount tests
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/fuser${{ matrix.suffix }}
           bash ../osx_mount_tests.sh ${{ matrix.suffix }}
