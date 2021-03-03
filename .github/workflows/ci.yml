@@ -24,14 +24,14 @@ jobs:
 
       - name: Run tests core
         run: |
-          cd $GITHUB_WORKSPACE/fuser
+          cd $GITHUB_WORKSPACE/fuser/fuser
           cargo build --all --all-targets --features=${{ matrix.features }}
           cargo build --all --all-targets --no-default-features
           cargo test --all --features=${{ matrix.features }}
           cargo doc --all --no-deps --features=${{ matrix.features }}
       - name: Run tests async
         run: |
-          cd $GITHUB_WORKSPACE/fuser-async
+          cd $GITHUB_WORKSPACE/fuser/fuser-async
           cargo build --all --all-targets --features=${{ matrix.features }}
           cargo build --all --all-targets --no-default-features
           cargo test --all --features=${{ matrix.features }}
@@ -73,9 +73,9 @@ jobs:
 
       - name: Run core tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser
+          cd $GITHUB_WORKSPACE/fuser/fuser
           INTERACTIVE="" make pre
       - name: Run async tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser-async
+          cd $GITHUB_WORKSPACE/fuser/fuser-async
           INTERACTIVE="" make pre

@@ -1,6 +1,8 @@
 #!/bin/bash
 
 set -e
+EXAMPLE_TARGET=$1
+shift
 
 # Check for rustup installed
 if [ ! -f ~/.rustup/settings.toml ]; then
@@ -21,7 +23,7 @@ cd /code/fuser
 
 cargo build --release --examples --features=abi-7-28
 
-cp target/release/examples/simple /bin/fuser
+cp target/release/examples/$EXAMPLE_TARGET /bin/fuser
 
 cd /code/fuser
 exec ./xfstests.sh "$@"

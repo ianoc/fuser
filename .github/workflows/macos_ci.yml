@@ -5,6 +5,9 @@ on:
 jobs:
   ci-macos:
     runs-on: macos-latest
+    strategy:
+      matrix:
+        flavor: [fuser, fuser-async]
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
     steps:
@@ -29,6 +32,9 @@ jobs:
         with:
           path: ~/.cargo/git
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      - name: cd into the path
+        run: |
+          cd $GITHUB_WORKSPACE/fuser/${{ matrix.flavor }}
       - name: Build all targets
         run: cargo build --all --all-targets
       - name: Build all targets, all features
