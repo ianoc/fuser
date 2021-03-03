@@ -10,7 +10,7 @@ jobs:
       matrix:
         libfuse: [libfuse-dev, libfuse3-dev]
         features: [ '', 'abi-7-19' ]
-        flavor: ['fuse', 'fuse-async']
+        flavor: ['fuser', 'fuser-async']
     steps:
       - uses: actions/checkout@v2
       - name: Install packages
