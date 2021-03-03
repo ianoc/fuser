@@ -19,4 +19,4 @@ ARG BUILD_FEATURES
 
 ADD . /code/fuser/
 
-RUN cd /code/fuser/fuser-async && cargo build --release --examples $BUILD_FEATURES && cp target/release/examples/simple-async /bin/fuser
+RUN cd /code/fuser/fuser-async && cargo build --release --examples $BUILD_FEATURES && cp ../target/release/examples/simple-async /bin/fuser
