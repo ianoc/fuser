@@ -7,6 +7,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
+        name: [synchronous, async]
         include:
           - name: synchronous
             suffix: "__ignore__"
