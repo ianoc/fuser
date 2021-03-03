@@ -25,10 +25,10 @@ jobs:
       - name: Run tests core
         run: |
           cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
-          cargo build --all --all-targets --features=${{ matrix.features }}
-          cargo build --all --all-targets --no-default-features
-          cargo test --all --features=${{ matrix.features }}
-          cargo doc --all --no-deps --features=${{ matrix.features }}
+          cargo build --all-targets --features=${{ matrix.features }}
+          cargo build --all-targets --no-default-features
+          cargo test --features=${{ matrix.features }}
+          cargo doc --no-deps --features=${{ matrix.features }}
 
   ci:
     runs-on: ubuntu-20.04
