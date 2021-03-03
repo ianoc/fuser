@@ -34,7 +34,7 @@ jobs:
           key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
       - name: cd into the path
         run: |
-          cd $GITHUB_WORKSPACE/fuser/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
       - name: Build all targets
         run: cargo build --all --all-targets
       - name: Build all targets, all features
