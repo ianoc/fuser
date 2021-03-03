@@ -102,6 +102,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuser-async"
+version = "0.7.0"
+dependencies = [
+ "bincode",
+ "clap",
+ "env_logger",
+ "libc",
+ "log",
+ "page_size",
+ "pkg-config",
+ "serde",
+ "users",
+ "zerocopy",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.1.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

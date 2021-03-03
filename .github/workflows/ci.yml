@@ -62,5 +62,11 @@ jobs:
       - name: Install cargo-deny
         run: cargo install --force cargo-deny --locked
 
-      - name: Run tests
-        run: INTERACTIVE="" make pre
+      - name: Run core tests
+        run: |
+          cd fuser
+          INTERACTIVE="" make pre
+      - name: Run async tests
+        run: |
+          cd ../fuser-async
+          INTERACTIVE="" make pre
