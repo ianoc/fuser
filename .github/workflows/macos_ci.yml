@@ -7,7 +7,13 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
-        suffix: ["__ignore__", "-async"]
+        include:
+          - name: synchronous
+            suffix: "__ignore__"
+            sub_path: "fuser"
+          - name: async
+            suffix: "-async"
+            sub_path: "fuser-async"
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
     steps:

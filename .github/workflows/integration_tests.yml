@@ -8,7 +8,13 @@ jobs:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
-        flavor: [fuser, fuser-async]
+        include:
+          - name: synchronous
+            suffix: "__ignore__"
+            sub_path: "fuser"
+          - name: async
+            suffix: "-async"
+            sub_path: "fuser-async"
         test_group: [mount_tests, pjdfs_tests_fuse2, pjdfs_tests_fuse3, pjdfs_tests_pure]
 
     steps:
@@ -40,13 +46,21 @@ jobs:
 
       - name: Run tests
         run: |
-          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/${{ matrix.sub_path }}
           INTERACTIVE="" make ${{ matrix.test_group }}
   xfs_integration_tests:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
-        suffix: ["__ignore__", "-async"]
+    strategy:
+      matrix:
+        include:
+          - name: synchronous
+            suffix: "__ignore__"
+            sub_path: "fuser"
+          - name: async
+            suffix: "-async"
+            sub_path: "fuser-async"
         test_group: ["generic/0*", "generic/1*", "generic/2*", "generic/3*", "generic/4*", "generic/5*", "generic/6*"]
     steps:
       - uses: actions/checkout@v2
