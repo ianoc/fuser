@@ -40,13 +40,13 @@ jobs:
 
       - name: Run tests
         run: |
-          cd $GITHUB_WORKSPACE/fuser/${{ matrix.flavor }}
+          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
           INTERACTIVE="" make ${{ matrix.test_group }}
   xfs_integration_tests:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
-        example_target: [simple, simple-async]
+        suffix: ["", "-async"]
         test_group: ["generic/0*", "generic/1*", "generic/2*", "generic/3*", "generic/4*", "generic/5*", "generic/6*"]
     steps:
       - uses: actions/checkout@v2
@@ -73,6 +73,6 @@ jobs:
           -v "$HOME/docker_data/docker-xfstests:/code/xfstests"
           -v "$GITHUB_WORKSPACE/logs:/code/logs"
           fuser:xfstests
-          bash -c "/code/fuser/.github/scripts/xfs_inside_docker_tests.sh ${{ matrix.example_target }} ${{matrix.test_group}}"
+          bash -c "/code/fuser/.github/scripts/xfs_inside_docker_tests.sh ${{ matrix.suffix }} ${{matrix.test_group}}"
       - name: Fix permissions
         run: sudo chown -R $USER ~/docker_data

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 set -e
-EXAMPLE_TARGET=$1
+SUFFIX=$1
 shift
 
 # Check for rustup installed
@@ -19,11 +19,11 @@ if [ ! -f /code/fuse-xfstests/check ]; then
     make
 fi
 
-cd /code/fuser
+cd /code/fuser/fuser-${SUFFIX}
 
 cargo build --release --examples --features=abi-7-28
 
-cp target/release/examples/$EXAMPLE_TARGET /bin/fuser
+cp target/release/examples/simple$SUFFIX /bin/fuser
 
 cd /code/fuser
 exec ./xfstests.sh "$@"
