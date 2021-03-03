@@ -1,9 +1,9 @@
 #![allow(clippy::needless_return)]
 
 use clap::{crate_version, App, Arg};
-use fuser::consts::FOPEN_DIRECT_IO;
-use fuser::TimeOrNow::Now;
-use fuser::{
+use fuser_async::consts::FOPEN_DIRECT_IO;
+use fuser_async::TimeOrNow::Now;
+use fuser_async::{
     Filesystem, KernelConfig, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     FUSE_ROOT_ID,
@@ -48,12 +48,12 @@ enum FileKind {
     Symlink,
 }
 
-impl From<FileKind> for fuser::FileType {
+impl From<FileKind> for fuser_async::FileType {
     fn from(kind: FileKind) -> Self {
         match kind {
-            FileKind::File => fuser::FileType::RegularFile,
-            FileKind::Directory => fuser::FileType::Directory,
-            FileKind::Symlink => fuser::FileType::Symlink,
+            FileKind::File => fuser_async::FileType::RegularFile,
+            FileKind::Directory => fuser_async::FileType::Directory,
+            FileKind::Symlink => fuser_async::FileType::Symlink,
         }
     }
 }
@@ -192,9 +192,9 @@ struct InodeAttributes {
     pub xattrs: BTreeMap<Vec<u8>, Vec<u8>>,
 }
 
-impl From<InodeAttributes> for fuser::FileAttr {
+impl From<InodeAttributes> for fuser_async::FileAttr {
     fn from(attrs: InodeAttributes) -> Self {
-        fuser::FileAttr {
+        fuser_async::FileAttr {
             ino: attrs.inode,
             size: attrs.size,
             blocks: (attrs.size + BLOCK_SIZE - 1) / BLOCK_SIZE,
@@ -240,7 +240,7 @@ impl SimpleFS {
         let current_inode = if let Ok(file) = File::open(&path) {
             bincode::deserialize_from(file).unwrap()
         } else {
-            fuser::FUSE_ROOT_ID
+            fuser_async::FUSE_ROOT_ID
         };
 
         let file = OpenOptions::new()
@@ -1848,7 +1848,7 @@ fn main() {
         .unwrap_or_default()
         .to_string();
 
-    fuser::mount2(
+    fuser_async::mount2(
         SimpleFS::new(data_dir, matches.is_present("direct-io")),
         mountpoint,
         &options,

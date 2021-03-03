@@ -1,4 +1,4 @@
-use fuser::{
+use fuser_async::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     Request,
 };
@@ -124,5 +124,5 @@ fn main() {
             options.push(MountOption::AutoUnmount);
         }
     }
-    fuser::mount2(HelloFS, mountpoint, &options).unwrap();
+    fuser_async::mount2(HelloFS, mountpoint, &options).unwrap();
 }
