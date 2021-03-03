@@ -7,6 +7,7 @@ jobs:
     runs-on: macos-latest
     strategy:
       matrix:
+        suffix: ["", "-async"]
         flavor: [fuser, fuser-async]
     env:
       PKG_CONFIG_PATH: /usr/local/lib/pkgconfig:$PKG_CONFIG_PATH
@@ -55,4 +56,4 @@ jobs:
       - name: Run macos mount tests
         run: |
           cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
-          bash ../osx_mount_tests.sh
+          bash ../osx_mount_tests.sh ${{ matrix.suffix }}

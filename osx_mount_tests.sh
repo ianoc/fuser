@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
 set -x
+SUFFIX=$!
+shift
 
 exit_handler() {
     exit "${TEST_EXIT_STATUS:-1}"
@@ -16,8 +18,8 @@ RED="\e[31m"
 
 function run_test {
   DIR=$(mktemp -d)
-  cargo build --example hello $1 > /dev/null 2>&1
-  cargo run --example hello $1 -- $DIR $3 &
+  cargo build --example hello$SUFFIX $1 > /dev/null 2>&1
+  cargo run --example hello$SUFFIX $1 -- $DIR $3 &
   FUSE_PID=$!
   sleep 2
 
