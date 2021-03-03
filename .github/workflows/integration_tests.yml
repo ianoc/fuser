@@ -8,6 +8,7 @@ jobs:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
+        flavor: [fuser, fuser-async]
         test_group: [mount_tests, pjdfs_tests_fuse2, pjdfs_tests_fuse3, pjdfs_tests_pure]
 
     steps:
@@ -38,11 +39,14 @@ jobs:
           key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run tests
-        run: INTERACTIVE="" make ${{ matrix.test_group }}
+        run: |
+          cd $GITHUB_WORKSPACE/${{ matrix.flavor }}
+          INTERACTIVE="" make ${{ matrix.test_group }}
   xfs_integration_tests:
     runs-on: ubuntu-20.04
     strategy:
       matrix:
+        flavor: [fuser, fuser-async]
         test_group: ["generic/0*", "generic/1*", "generic/2*", "generic/3*", "generic/4*", "generic/5*", "generic/6*"]
     steps:
       - uses: actions/checkout@v2
@@ -60,6 +64,7 @@ jobs:
           docker build -t fuser:xfstests -f .github/scripts/xfstests_min.Dockerfile .
       - name: Run tests
         run: >-
+          cd $GITHUB_WORKSPACE/${{ matrix.flavor }};
           docker run --rm -t --cap-add SYS_ADMIN --device /dev/fuse --security-opt apparmor:unconfined
           --memory=2g --kernel-memory=200m 
           -v "$GITHUB_WORKSPACE:/code/fuser"
