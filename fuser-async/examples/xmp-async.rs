@@ -1008,5 +1008,7 @@ async fn main() {
     ];
     let mut xmp = XmpFS::new(&mount_src);
     xmp.populate_root_dir().await;
-    fuser_async::mount2(xmp, 16, mount_dest, &options).await.unwrap();
+    fuser_async::mount2(xmp, 16, mount_dest, &options)
+        .await
+        .unwrap();
 }

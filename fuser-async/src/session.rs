@@ -20,11 +20,11 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 use crate::channel::{self, Channel};
 use crate::io_ops::ArcSubChannel;
-use fuser::ll::fuse_abi as abi;
 use crate::request::Request;
 use crate::Filesystem;
 #[cfg(not(feature = "libfuse"))]
 use crate::MountOption;
+use fuser::ll::fuse_abi as abi;
 use std::ops::DerefMut;
 
 /// The max size of write requests from the kernel. The absolute minimum is 4k,

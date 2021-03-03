@@ -17,14 +17,14 @@ use std::path::Path;
 use std::time::Duration;
 use std::time::SystemTime;
 
+use crate::session::MAX_WRITE_SIZE;
+use async_trait::async_trait;
 use fuser::ll::fuse_abi::consts::*;
 pub use fuser::ll::fuse_abi::FUSE_ROOT_ID;
 pub use fuser::ll::{fuse_abi::consts, TimeOrNow};
 use fuser::mount_options::check_option_conflicts;
 #[cfg(feature = "libfuse")]
 use fuser::mount_options::option_to_string;
-use crate::session::MAX_WRITE_SIZE;
-use async_trait::async_trait;
 pub use fuser::mount_options::MountOption;
 #[cfg(target_os = "macos")]
 pub use reply::ReplyXTimes;
@@ -316,7 +316,11 @@ pub trait Filesystem: Send + Sync + 'static {
     /// Like forget, but take multiple forget requests at once for performance. The default
     /// implementation will fallback to forget.
     #[cfg(feature = "abi-7-16")]
-    async fn batch_forget(&self, req: &Request<'_>, nodes: &[ll::fuse_abi::fuse_forget_one]) {
+    async fn batch_forget(
+        &self,
+        req: &Request<'_>,
+        nodes: &[fuser::ll::fuse_abi::fuse_forget_one],
+    ) {
         for node in nodes {
             self.forget(req, node.nodeid, node.nlookup).await;
         }

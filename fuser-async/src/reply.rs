@@ -6,6 +6,8 @@
 //! data without cloning the data. A reply *must always* be used (by calling either ok() or
 //! error() exactly once).
 
+use crate::{FileAttr, FileType};
+use async_trait::async_trait;
 #[cfg(target_os = "macos")]
 use fuser::ll::fuse_abi::fuse_getxtimes_out;
 use fuser::ll::fuse_abi::{
@@ -13,8 +15,6 @@ use fuser::ll::fuse_abi::{
     fuse_entry_out, fuse_file_lock, fuse_getxattr_out, fuse_ioctl_out, fuse_kstatfs, fuse_lk_out,
     fuse_lseek_out, fuse_open_out, fuse_out_header, fuse_statfs_out, fuse_write_out,
 };
-use crate::{FileAttr, FileType};
-use async_trait::async_trait;
 use libc::{c_int, EIO, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFREG, S_IFSOCK};
 use log::warn;
 use std::convert::{AsRef, TryInto};

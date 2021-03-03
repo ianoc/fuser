@@ -5,8 +5,8 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
-use fuser::ll::fuse_abi as abi;
 use crate::{io_ops::ArcSubChannel, session::ActiveSession};
+use fuser::ll::fuse_abi as abi;
 use libc::{EIO, ENOSYS, EPROTO};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
@@ -19,8 +19,8 @@ use std::sync::Arc;
 use crate::reply::ReplyDirectoryPlus;
 use crate::reply::{Reply, ReplyDirectory, ReplyEmpty, ReplyRaw};
 use crate::Filesystem;
-use fuser::ll;
 use crate::KernelConfig;
+use fuser::ll;
 
 /// Request data structure
 #[derive(Debug)]
