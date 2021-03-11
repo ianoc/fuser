@@ -1875,7 +1875,7 @@ async fn main() {
     .unwrap();
 }
 
-#[cfg(not(feature = "async_impl"))]
+#[cfg(not(any(feature = "async_tokio")))]
 fn main() {
     panic!("No async implementation enabled.")
 }
